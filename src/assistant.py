@@ -518,10 +518,16 @@ def get_sensor_summary():
         voltage = energy.get("battery_voltage")
         if batt is not None:
             lines.append(f"Battery: {batt}%")
-        if solar is not None:
-            lines.append(f"Solar: {solar}W")
         if voltage is not None:
             lines.append(f"Battery voltage: {voltage}V")
+        if energy.get("time_remaining_minutes") is not None:
+            lines.append(f"Time to empty: {energy['time_remaining_minutes']} minutes")
+        if energy.get("consumption_watts") is not None:
+            lines.append(f"Consumption: {energy['consumption_watts']}W")
+        if solar is not None:
+            lines.append(f"Solar: {solar}W")
+        if energy.get("charge_type") is not None:
+            lines.append(f"Charge state: {energy['charge_type']}")
 
     gps = sensor_data.get("local/gps/latlon")
     if gps:
@@ -918,6 +924,11 @@ _DATE_PATTERNS = [
     re.compile(r"\btoday(?:'s|s)?\s+(?:date|day)\b", re.I),
     re.compile(r"\bcurrent\s+date\b", re.I),
 ]
+_DST_PATTERNS = [
+    re.compile(r"\b(?:time\s+change|daylight\s+saving|dst)\b", re.I),
+    re.compile(r"\b(?:spring|fall)\s+(?:forward|back)\b", re.I),
+    re.compile(r"\bclocks?\s+(?:change|go\s+(?:forward|back))\b", re.I),
+]
 _ELEVATION_PATTERNS = [
     re.compile(r"\b(?:elevation|altitude)\b", re.I),
     re.compile(r"\bhow\s+high\s+(?:up\s+)?(?:am\s+i|are\s+we)\b", re.I),
@@ -1001,6 +1012,38 @@ def _gps_to_local_datetime(gps_time):
         return utc_dt + timedelta(hours=offset_hours)
     except (ValueError, KeyError, TypeError):
         return None
+
+
+def _next_dst_transition(tz_name, now_utc):
+    """Find the next DST transition for a timezone.
+
+    Scans day-by-day up to 365 days out looking for a UTC offset change.
+    Returns (local_datetime, direction) where direction is 'spring forward'
+    or 'fall back', or None if no transition found (e.g. timezone has no DST).
+    """
+    try:
+        tz = ZoneInfo(tz_name)
+        prev_offset = now_utc.astimezone(tz).utcoffset()
+        for day in range(1, 366):
+            check = now_utc + timedelta(days=day)
+            cur_offset = check.astimezone(tz).utcoffset()
+            if cur_offset != prev_offset:
+                # Found the day of transition — binary search for exact moment
+                lo = check - timedelta(days=1)
+                hi = check
+                for _ in range(20):  # converge to ~1 minute
+                    mid = lo + (hi - lo) / 2
+                    if mid.astimezone(tz).utcoffset() == prev_offset:
+                        lo = mid
+                    else:
+                        hi = mid
+                transition_local = hi.astimezone(tz)
+                direction = "spring forward" if cur_offset > prev_offset else "fall back"
+                return transition_local, direction
+            prev_offset = cur_offset
+    except Exception:
+        pass
+    return None
 
 
 def match_intent(text):
@@ -1171,11 +1214,35 @@ def match_intent(text):
                 if energy.get("battery_percent") is not None:
                     parts.append(f"battery is at {energy['battery_percent']}%")
                 if energy.get("battery_voltage") is not None:
-                    parts.append(f"{energy['battery_voltage']} volts")
-                if energy.get("solar_watts") is not None:
-                    parts.append(f"solar is producing {energy['solar_watts']} watts")
+                    parts.append(f"at {energy['battery_voltage']} volts")
                 if parts:
-                    return "The " + ", ".join(parts) + "."
+                    response = "The " + " ".join(parts) + "."
+                else:
+                    response = ""
+                # Time to empty
+                ttg = energy.get("time_remaining_minutes")
+                if ttg is not None and ttg > 0:
+                    days, remainder = divmod(int(ttg), 1440)
+                    hours, minutes = divmod(remainder, 60)
+                    time_parts = []
+                    if days > 0:
+                        time_parts.append(f"{days} day{'s' if days != 1 else ''}")
+                    if hours > 0:
+                        time_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+                    if minutes > 0 and days == 0:
+                        time_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+                    if time_parts:
+                        response += f" Estimated time remaining is {' and '.join(time_parts)}."
+                # Solar and consumption
+                extras = []
+                if energy.get("solar_watts") is not None:
+                    extras.append(f"solar is producing {energy['solar_watts']} watts")
+                if energy.get("consumption_watts") is not None:
+                    extras.append(f"current draw is {energy['consumption_watts']} watts")
+                if extras:
+                    response += " " + ", and ".join(extras).capitalize() + "."
+                if response:
+                    return response.strip()
             return "I don't have energy data right now."
 
     for pattern in _LOCATION_PATTERNS:
@@ -1219,6 +1286,39 @@ def match_intent(text):
                 month_name = months[m] if 1 <= m <= 12 else str(m)
                 return f"Today is {month_name} {gps_time.get('day', '?')}, {gps_time['year']}."
             return "I don't have date data right now."
+
+    for pattern in _DST_PATTERNS:
+        if pattern.search(text):
+            print("  Intent: DST / time change query")
+            gps_time = sensor_data.get("local/gps/time")
+            gps = sensor_data.get("local/gps/latlon")
+            if (gps_time and gps_time.get("year") is not None
+                    and _tz_finder is not None
+                    and gps and gps.get("latitude") is not None):
+                tz_name = _tz_finder.timezone_at(
+                    lat=gps["latitude"], lng=gps["longitude"],
+                )
+                if tz_name:
+                    now_utc = datetime(
+                        gps_time["year"], gps_time["month"], gps_time["day"],
+                        gps_time["hour"], gps_time.get("minute", 0),
+                        gps_time.get("second", 0), tzinfo=timezone.utc,
+                    )
+                    result = _next_dst_transition(tz_name, now_utc)
+                    if result:
+                        trans_dt, direction = result
+                        months = ["", "January", "February", "March", "April",
+                                  "May", "June", "July", "August", "September",
+                                  "October", "November", "December"]
+                        month_name = months[trans_dt.month]
+                        hour_12 = trans_dt.hour % 12 or 12
+                        ampm = "AM" if trans_dt.hour < 12 else "PM"
+                        return (
+                            f"The next time change is {month_name} {trans_dt.day}, "
+                            f"{trans_dt.year} at {hour_12} {ampm} when clocks {direction}."
+                        )
+                    return "Your current timezone doesn't observe daylight saving time."
+            return "I don't have location data to determine time zone changes."
 
     for pattern in _ELEVATION_PATTERNS:
         if pattern.search(text):
