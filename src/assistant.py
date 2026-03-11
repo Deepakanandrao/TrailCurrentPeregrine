@@ -345,11 +345,15 @@ sensor_data = {}
 known_light_ids = set()  # populated from local/lights/+/status messages
 mqtt = None
 
-# Device registry: populated from MQTT retained topic local/config/pdm_channels
+# Device registry: populated from MQTT retained topics
+#   local/config/pdm_channels   (Torrent lights)
+#   local/config/relay_channels  (Switchback relays)
 _device_registry = {}      # "living room" -> {"id": 1, "type": "light", "name": "Living Room"}
 _device_names_by_id = {}   # 1 -> "Living Room"
 _device_types_by_id = {}   # 1 -> "light"
+_relay_channel_by_id = {}  # 101 -> 1  (maps device ID to MQTT relay channel number)
 _DEVICE_CACHE_PATH = os.path.expanduser("~/device_registry.json")
+_RELAY_CACHE_PATH = os.path.expanduser("~/relay_registry.json")
 
 
 def _save_device_cache(channels):
@@ -370,39 +374,98 @@ def _load_device_cache():
         return None
 
 
-def _update_device_registry(channels, save=True):
-    """Rebuild the device registry from a list of channel config dicts."""
+def _rebuild_device_registry():
+    """Merge PDM and relay entries into the unified device registry."""
     global _device_registry, _device_names_by_id, _device_types_by_id
-    new_registry = {}
-    new_names = {}
-    new_types = {}
+    merged = {}
+    names = {}
+    types = {}
+    for entries in (_pdm_entries, _relay_entries):
+        for ch_id, info in entries.items():
+            key = info["name"].strip().lower()
+            merged[key] = info
+            names[ch_id] = info["name"]
+            types[ch_id] = info["type"]
+    _device_registry = merged
+    _device_names_by_id = names
+    _device_types_by_id = types
+    print(f"  Device registry updated: {len(merged)} devices")
+    for key, info in merged.items():
+        print(f"    [{info['id']}] {info['name']} ({info['type']})")
+
+
+# Internal stores for PDM vs relay entries (keyed by device ID)
+_pdm_entries = {}    # {1: {"id": 1, "type": "light", "name": "Living Room"}, ...}
+_relay_entries = {}  # {101: {"id": 101, "type": "relay", "name": "Water Pump"}, ...}
+
+
+def _update_device_registry(channels, save=True):
+    """Rebuild the PDM portion of the device registry."""
+    global _pdm_entries
+    _pdm_entries = {}
     for ch in channels:
         ch_id = ch.get("id")
         ch_name = ch.get("name", "")
         ch_type = ch.get("type", "unknown")
         if ch_id is None or not ch_name:
             continue
-        key = ch_name.strip().lower()
-        new_registry[key] = {"id": int(ch_id), "type": ch_type, "name": ch_name}
-        new_names[int(ch_id)] = ch_name
-        new_types[int(ch_id)] = ch_type
-    _device_registry = new_registry
-    _device_names_by_id = new_names
-    _device_types_by_id = new_types
-    print(f"  Device registry updated: {len(new_registry)} devices")
-    for key, info in new_registry.items():
-        print(f"    [{info['id']}] {info['name']} ({info['type']})")
+        _pdm_entries[int(ch_id)] = {"id": int(ch_id), "type": ch_type, "name": ch_name}
+    _rebuild_device_registry()
     if save:
         _save_device_cache(channels)
 
 
-# Load cached device registry at startup (before MQTT connects)
+def _save_relay_cache(channels):
+    """Persist the raw relay channel list to disk."""
+    try:
+        with open(_RELAY_CACHE_PATH, "w") as f:
+            json.dump(channels, f)
+    except OSError as e:
+        print(f"  Warning: could not save relay cache: {e}")
+
+
+def _load_relay_cache():
+    """Load cached relay channel list from disk, if available."""
+    try:
+        with open(_RELAY_CACHE_PATH, "r") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _update_relay_registry(channels, save=True):
+    """Rebuild the relay portion of the device registry."""
+    global _relay_entries, _relay_channel_by_id
+    _relay_entries = {}
+    _relay_channel_by_id = {}
+    for ch in channels:
+        ch_id = ch.get("id")
+        ch_name = ch.get("name", "")
+        relay_ch = ch.get("relay_channel")
+        if ch_id is None or not ch_name or relay_ch is None:
+            continue
+        ch_type = ch.get("type", "other")
+        _relay_entries[int(ch_id)] = {"id": int(ch_id), "type": ch_type, "name": ch_name}
+        _relay_channel_by_id[int(ch_id)] = int(relay_ch)
+    _rebuild_device_registry()
+    if save:
+        _save_relay_cache(channels)
+
+
+# Load cached registries at startup (before MQTT connects)
 _cached_channels = _load_device_cache()
 if _cached_channels:
     print("Loading cached device registry...")
     _update_device_registry(_cached_channels, save=False)
 else:
     print("No cached device registry found (will populate from MQTT).")
+
+_cached_relays = _load_relay_cache()
+if _cached_relays:
+    print("Loading cached relay registry...")
+    _update_relay_registry(_cached_relays, save=False)
+else:
+    print("No cached relay registry found (will populate from MQTT).")
 
 import threading
 
@@ -423,8 +486,10 @@ def _connect_mqtt():
             client.subscribe("local/gps/time")
             client.subscribe("local/gps/alt")
             client.subscribe("local/lights/+/status")
+            client.subscribe("local/relays/+/status")
             client.subscribe("local/thermostat/status")
             client.subscribe("local/config/pdm_channels")
+            client.subscribe("local/config/relay_channels")
             _mqtt_connected.set()
         else:
             print(f"MQTT connection failed (rc={rc})")
@@ -445,6 +510,10 @@ def _connect_mqtt():
             elif msg.topic == "local/config/pdm_channels":
                 channels = payload.get("channels", [])
                 _update_device_registry(channels)
+            # Update relay registry from Switchback channel config
+            elif msg.topic == "local/config/relay_channels":
+                channels = payload.get("channels", [])
+                _update_relay_registry(channels)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -558,7 +627,7 @@ def get_system_prompt():
             prompt += f"- ID {info['id']}: \"{info['name']}\" (type: {info['type']})\n"
         prompt += (
             "Use the device name in responses. "
-            "Only lights support brightness. All devices support on/off.\n"
+            "Only lights support brightness. Relays and other devices are on/off only.\n"
         )
 
     return prompt
@@ -594,7 +663,11 @@ def _update_device_state(device_id, **kwargs):
 
 
 def _execute_light_command(light_id, state):
-    """Send a light command via MQTT. Returns spoken confirmation."""
+    """Send a light command via MQTT. Returns spoken confirmation.
+
+    Handles both PDM lights (local/lights/{id}/command) and Switchback relays
+    typed as "light" (local/relays/{channel}/command).
+    """
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
 
@@ -606,18 +679,36 @@ def _execute_light_command(light_id, state):
             return "I don't know which lights are available yet."
         sent = 0
         for lid in sorted(light_ids):
-            # Only send to lights that need to change
-            status = sensor_data.get(f"local/lights/{lid}/status", {})
-            current = status.get("state")
-            if current is not None and current == state:
-                name = _device_names_by_id.get(lid, f"light {lid}")
-                print(f"  Skipping {name} (already {state_word})")
-                continue
-            topic = f"local/lights/{lid}/command"
-            payload = json.dumps({"state": state})
-            mqtt.publish(topic, payload)
-            _update_device_state(lid, state=state)
-            print(f"  MQTT publish: {topic} -> {payload}")
+            relay_ch = _relay_channel_by_id.get(lid)
+            if relay_ch is not None:
+                # Switchback relay typed as "light" — use relay topic
+                status = sensor_data.get(f"local/relays/{relay_ch}/status", {})
+                current = status.get("state")
+                if current is not None and current == state:
+                    name = _device_names_by_id.get(lid, f"light {lid}")
+                    print(f"  Skipping {name} (already {state_word})")
+                    continue
+                name = _device_names_by_id.get(lid, f"relay {relay_ch}")
+                topic = f"local/relays/{relay_ch}/command"
+                payload = json.dumps({"state": state})
+                mqtt.publish(topic, payload)
+                if f"local/relays/{relay_ch}/status" not in sensor_data:
+                    sensor_data[f"local/relays/{relay_ch}/status"] = {}
+                sensor_data[f"local/relays/{relay_ch}/status"]["state"] = state
+                print(f"  MQTT publish: {topic} -> {payload}")
+            else:
+                # PDM light — use lights topic
+                status = sensor_data.get(f"local/lights/{lid}/status", {})
+                current = status.get("state")
+                if current is not None and current == state:
+                    name = _device_names_by_id.get(lid, f"light {lid}")
+                    print(f"  Skipping {name} (already {state_word})")
+                    continue
+                topic = f"local/lights/{lid}/command"
+                payload = json.dumps({"state": state})
+                mqtt.publish(topic, payload)
+                _update_device_state(lid, state=state)
+                print(f"  MQTT publish: {topic} -> {payload}")
             sent += 1
         if sent == 0:
             return f"All lights are already {state_word}."
@@ -663,9 +754,18 @@ def _execute_brightness_command(light_id, percent):
 
 
 def _execute_device_command(device_id, device_name, device_type, state):
-    """Send an on/off command for any PDM device via MQTT."""
+    """Send an on/off command for any device via MQTT.
+
+    Routes to relay topics for Switchback devices, light topics for PDM devices.
+    """
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
+
+    # Route relay devices through the relay MQTT topics
+    relay_ch = _relay_channel_by_id.get(int(device_id))
+    if relay_ch is not None or device_type == "relay":
+        return _execute_relay_command(device_id, device_name, state, relay_ch)
+
     state_word = "on" if state else "off"
     topic = f"local/lights/{device_id}/command"
     payload = json.dumps({"state": state})
@@ -675,8 +775,74 @@ def _execute_device_command(device_id, device_name, device_type, state):
     return f"Turning {state_word} the {device_name}."
 
 
+def _execute_relay_command(device_id, device_name, state, relay_channel=None):
+    """Send a relay on/off command via MQTT.
+
+    Individual relays are toggled via local/relays/{channel}/command.
+    The Switchback CAN protocol only supports toggle for individual relays,
+    so we check current state and skip if already in the desired state.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+    state_word = "on" if state else "off"
+
+    if relay_channel is None:
+        relay_channel = _relay_channel_by_id.get(int(device_id))
+    if relay_channel is None:
+        return f"Sorry, I don't know the relay channel for {device_name}."
+
+    # Check current state — individual relay commands are toggles on CAN,
+    # so skip if already in the desired state to avoid toggling back
+    status_topic = f"local/relays/{relay_channel}/status"
+    current = sensor_data.get(status_topic, {}).get("state")
+    if current is not None and current == state:
+        return f"The {device_name} is already {state_word}."
+
+    topic = f"local/relays/{relay_channel}/command"
+    payload = json.dumps({"state": state})
+    mqtt.publish(topic, payload)
+    # Optimistic state update on the relay status topic
+    if status_topic not in sensor_data:
+        sensor_data[status_topic] = {}
+    sensor_data[status_topic]["state"] = state
+    print(f"  MQTT publish: {topic} -> {payload}")
+    return f"Turning {state_word} the {device_name}."
+
+
+def _execute_relay_all_command(state):
+    """Send all-relays on/off command via MQTT."""
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+    state_word = "on" if state else "off"
+
+    if not _relay_channel_by_id:
+        return "I don't know which relays are available yet."
+
+    topic = "local/relays/all/command"
+    payload = json.dumps({"state": state})
+    mqtt.publish(topic, payload)
+    # Optimistic state update for all relay channels
+    for dev_id, relay_ch in _relay_channel_by_id.items():
+        status_topic = f"local/relays/{relay_ch}/status"
+        if status_topic not in sensor_data:
+            sensor_data[status_topic] = {}
+        sensor_data[status_topic]["state"] = state
+    print(f"  MQTT publish: {topic} -> {payload}")
+    return f"Turning {state_word} all relays."
+
+
 def _get_device_status_response(device_id, device_name):
-    """Get status for any PDM device from cached MQTT data."""
+    """Get status for any device from cached MQTT data."""
+    # Check relay status first
+    relay_ch = _relay_channel_by_id.get(int(device_id))
+    if relay_ch is not None:
+        topic = f"local/relays/{relay_ch}/status"
+        payload = sensor_data.get(topic)
+        if not payload:
+            return f"I don't have status data for the {device_name}."
+        state_word = "on" if payload.get("state") == 1 else "off"
+        return f"The {device_name} is {state_word}."
+
     topic = f"local/lights/{device_id}/status"
     payload = sensor_data.get(topic)
     if not payload:
@@ -776,6 +942,19 @@ _STT_NORMALIZATIONS = [
     (re.compile(r"\blight\s+(?:first|1st)\b", re.I), "light 1"),
     (re.compile(r"\blight\s+(?:second|2nd)\b", re.I), "light 2"),
     (re.compile(r"\blight\s+(?:third|3rd)\b", re.I), "light 3"),
+    # Spoken number words after "relay" -> digits
+    (re.compile(r"\brelay\s+one\b", re.I), "relay 1"),
+    (re.compile(r"\brelay\s+two\b", re.I), "relay 2"),
+    (re.compile(r"\brelay\s+three\b", re.I), "relay 3"),
+    (re.compile(r"\brelay\s+four\b", re.I), "relay 4"),
+    (re.compile(r"\brelay\s+five\b", re.I), "relay 5"),
+    (re.compile(r"\brelay\s+six\b", re.I), "relay 6"),
+    (re.compile(r"\brelay\s+seven\b", re.I), "relay 7"),
+    (re.compile(r"\brelay\s+eight\b", re.I), "relay 8"),
+    (re.compile(r"\brelay\s+(?:won)\b", re.I), "relay 1"),
+    (re.compile(r"\brelay\s+(?:too?)\b", re.I), "relay 2"),
+    (re.compile(r"\brelay\s+(?:tree)\b", re.I), "relay 3"),
+    (re.compile(r"\brelay\s+(?:for|fore)\b", re.I), "relay 4"),
     # Common Whisper mishearings for key nouns
     (re.compile(r"\b(?:lites|lite)\b", re.I), "light"),
     (re.compile(r"\blied\b", re.I), "light"),  # "turn on the lied"
@@ -874,6 +1053,13 @@ _LIGHT_STATUS_PATTERNS = [
     re.compile(r"\bstatus\s+(?:of\s+)?(?:\w+\s+)*(?:lights?|lamps?)\b", re.I),
     re.compile(r"\b(?:what|how)\b.*\bstatus\b.*\b(?:lights?|lamps?)\b", re.I),
     re.compile(r"\b(?:what|how)\b.*\b(?:lights?|lamps?)\b", re.I),
+]
+_RELAY_STATUS_PATTERNS = [
+    re.compile(r"\b(?:are|is)\b.*\b(?:relays?|switches?|outlets?)\b.*\b(?:on|off)\b", re.I),
+    re.compile(r"\b(?:which|what)\s+(?:relays?|switches?|outlets?)\b", re.I),
+    re.compile(r"\b(?:relays?|switches?|outlets?)\s+status\b", re.I),
+    re.compile(r"\bstatus\s+(?:of\s+)?(?:\w+\s+)*(?:relays?|switches?|outlets?)\b", re.I),
+    re.compile(r"\b(?:what|how)\b.*\b(?:relays?|switches?|outlets?)\b", re.I),
 ]
 
 # Sensor query patterns
@@ -981,6 +1167,28 @@ def _get_light_status_response(light_id=None):
     return f"{', '.join(on_lights)} {'is' if len(on_lights) == 1 else 'are'} on. {', '.join(off_lights)} {'is' if len(off_lights) == 1 else 'are'} off."
 
 
+def _get_relay_status_response():
+    """Build a spoken summary of relay states from cached MQTT data."""
+    on_relays = []
+    off_relays = []
+    for dev_id, relay_ch in _relay_channel_by_id.items():
+        topic = f"local/relays/{relay_ch}/status"
+        payload = sensor_data.get(topic, {})
+        name = _device_names_by_id.get(dev_id, f"relay {relay_ch}")
+        if payload.get("state") == 1:
+            on_relays.append(name)
+        else:
+            off_relays.append(name)
+
+    if not on_relays and not off_relays:
+        return "I don't have relay status data right now."
+    if on_relays and not off_relays:
+        return f"All relays are on: {', '.join(on_relays)}."
+    if off_relays and not on_relays:
+        return "All relays are currently off."
+    return f"{', '.join(on_relays)} {'is' if len(on_relays) == 1 else 'are'} on. {', '.join(off_relays)} {'is' if len(off_relays) == 1 else 'are'} off."
+
+
 def _gps_to_local_datetime(gps_time):
     """Convert GPS UTC time to local time using the IANA timezone for the
     current GPS coordinates.  This handles DST transitions correctly.
@@ -1068,10 +1276,10 @@ def match_intent(text):
             print(f"  Intent: device status query (id={dev_id})")
             return _get_device_status_response(dev_id, dev_name)
 
-        # Brightness command (lights only)
+        # Brightness command (lights only — relays have no dimming)
         bm = _GENERIC_BRIGHTNESS_PATTERN.search(text)
         if bm:
-            if dev_type != "light":
+            if dev_type != "light" or dev_id in _relay_channel_by_id:
                 return f"The {dev_name} doesn't support brightness control."
             b_percent = max(0, min(100, int(bm.group(1))))
             print(f"  Intent: brightness (id={dev_id}, {b_percent}%)")
@@ -1089,15 +1297,31 @@ def match_intent(text):
                 return _execute_device_command(dev_id, dev_name, dev_type, 0)
 
     # --- "Everything" / "all" commands (no specific device or light keyword) ---
+    # "all the lights" → only type=="light" devices (both PDM and relay-backed)
+    # "everything" → all devices including non-light relays
     if not is_question and re.search(r"\b(?:everything|all)\b", text, re.I):
+        mentions_lights = bool(re.search(r"\b(?:lights?|lamps?)\b", text, re.I))
+        include_all_relays = not mentions_lights and bool(_relay_channel_by_id)
         for pattern in _GENERIC_ON_PATTERNS:
             if pattern.search(text):
-                print("  Intent: all devices on (everything)")
-                return _execute_light_command("all", 1)
+                print(f"  Intent: all {'devices' if include_all_relays else 'lights'} on")
+                responses = []
+                light_resp = _execute_light_command("all", 1)
+                if light_resp:
+                    responses.append(light_resp)
+                if include_all_relays:
+                    responses.append(_execute_relay_all_command(1))
+                return " ".join(responses) if responses else "No devices available."
         for pattern in _GENERIC_OFF_PATTERNS:
             if pattern.search(text):
-                print("  Intent: all devices off (everything)")
-                return _execute_light_command("all", 0)
+                print(f"  Intent: all {'devices' if include_all_relays else 'lights'} off")
+                responses = []
+                light_resp = _execute_light_command("all", 0)
+                if light_resp:
+                    responses.append(light_resp)
+                if include_all_relays:
+                    responses.append(_execute_relay_all_command(0))
+                return " ".join(responses) if responses else "No devices available."
 
     # --- Light status queries (check before commands to avoid false triggers) ---
     for pattern in _LIGHT_STATUS_PATTERNS:
@@ -1105,6 +1329,12 @@ def match_intent(text):
             status_id = _extract_light_id(text)
             print(f"  Intent: light status query (id={status_id or 'all'})")
             return _get_light_status_response(light_id=status_id)
+
+    # --- Relay status queries ---
+    for pattern in _RELAY_STATUS_PATTERNS:
+        if pattern.search(text):
+            print("  Intent: relay status query")
+            return _get_relay_status_response()
 
     # --- Brightness commands (check before on/off since "set light 1 to 50%" is more specific) ---
     if not is_question:
@@ -1372,7 +1602,7 @@ def handle_command(response_text):
 
     action = cmd.get("action")
 
-    if action in ("light", "device", "on", "off"):
+    if action in ("light", "device", "relay", "on", "off"):
         raw_id = cmd.get("id", "all")
         state = int(cmd.get("state", 1 if action == "on" else 0))
 
