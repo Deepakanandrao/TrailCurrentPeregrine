@@ -5,22 +5,22 @@
 # Usage:
 #   ./deploy.sh <board-ip-or-hostname>
 #   ./deploy.sh 192.168.1.100
-#   ./deploy.sh assistant@192.168.1.100
+#   ./deploy.sh root@192.168.1.100
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <user@host>"
-    echo "  e.g. $0 assistant@192.168.1.100"
+    echo "Usage: $0 <host-or-user@host>"
+    echo "  e.g. $0 192.168.1.100"
     exit 1
 fi
 
 TARGET="$1"
-# Default to assistant@ if no user specified
+# Default to root@ if no user specified (assistant user has no password)
 if [[ "$TARGET" != *@* ]]; then
-    TARGET="assistant@${TARGET}"
+    TARGET="root@${TARGET}"
 fi
 
 REMOTE_HOME="/home/assistant"
@@ -46,14 +46,14 @@ SSH="ssh -o ControlPath=$SOCK"
 # Ensure remote directories exist
 $SSH "$TARGET" "mkdir -p ${REMOTE_HOME}/models"
 
-# Ensure Python dependencies are up to date
+# Ensure Python dependencies are up to date (run as assistant user)
 echo "[1/4] Checking Python dependencies..."
 # --no-deps: tflite-runtime has no aarch64 wheel and we only use ONNX inference.
 # --force-reinstall ensures resource files (melspectrogram.onnx, embedding_model.onnx)
 # are included even when upgrading across major versions.
-$SSH "$TARGET" "${REMOTE_HOME}/assistant-env/bin/pip install -q --force-reinstall --no-deps openwakeword 2>&1 | tail -1"
+$SSH "$TARGET" "su -c '${REMOTE_HOME}/assistant-env/bin/pip install -q --force-reinstall --no-deps openwakeword 2>&1 | tail -1' assistant"
 # timezonefinder: DST-aware local time from GPS coordinates
-$SSH "$TARGET" "${REMOTE_HOME}/assistant-env/bin/pip install -q timezonefinder 2>&1 | tail -1"
+$SSH "$TARGET" "su -c '${REMOTE_HOME}/assistant-env/bin/pip install -q timezonefinder 2>&1 | tail -1' assistant"
 
 # Copy assistant.py
 echo "[2/4] Copying assistant.py..."
@@ -66,10 +66,10 @@ if [[ -f "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" ]]; then
     $SCP "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" "${TARGET}:${REMOTE_HOME}/models/hey_peregrine.onnx.data"
 fi
 
-# Copy service file
+# Copy service file and fix ownership (deploying as root, service runs as assistant)
 echo "[4/4] Copying service file..."
-$SCP "${SCRIPT_DIR}/config/voice-assistant.service" "${TARGET}:/tmp/voice-assistant.service"
-$SSH "$TARGET" "sudo cp /tmp/voice-assistant.service /etc/systemd/system/voice-assistant.service && sudo systemctl daemon-reload && rm /tmp/voice-assistant.service"
+$SCP "${SCRIPT_DIR}/config/voice-assistant.service" "${TARGET}:/etc/systemd/system/voice-assistant.service"
+$SSH "$TARGET" "systemctl daemon-reload && chown -R assistant:assistant ${REMOTE_HOME}"
 
 # Create default env file if it doesn't exist (never overwrite)
 $SSH "$TARGET" "test -f ${REMOTE_HOME}/assistant.env || cat > ${REMOTE_HOME}/assistant.env << 'ENVEOF'
@@ -112,6 +112,6 @@ fi
 
 echo ""
 echo "Restart the service:"
-echo "  sudo systemctl restart voice-assistant"
-echo "  sudo journalctl -u voice-assistant -f"
+echo "  systemctl restart voice-assistant"
+echo "  journalctl -u voice-assistant -f"
 echo ""

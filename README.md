@@ -1,6 +1,10 @@
 # TrailCurrentPeregrine
 
-Local voice assistant for the TrailCurrent platform, running on a Radxa Dragon Q6A (RK3588S, 8 GB RAM, Ubuntu Noble 24.04).
+Local voice assistant for the TrailCurrent platform, running on a Radxa Dragon Q6A (Qualcomm QCS6490, 8 GB RAM, Armbian Noble 24.04).
+
+<p align="center">
+  <img src="CAD/peregrine_case.png" alt="TrailCurrentPeregrine case" width="480">
+</p>
 
 ## Architecture
 
@@ -10,7 +14,7 @@ The assistant runs an entirely offline voice pipeline:
 2. **Speech-to-text** — faster-whisper (`base.en`, INT8 on CPU)
 3. **LLM** — Ollama with Qwen 2.5 0.5B (fits in ~1 GB RAM)
 4. **Text-to-speech** — Piper TTS (`en_US-libritts_r-medium`)
-5. **Device control** — MQTT integration with TrailCurrent (lights, sensors)
+5. **Device control** — MQTT integration with TrailCurrent (lights, relays, sensors)
 
 All processing happens on-device. No cloud services required.
 
@@ -52,12 +56,12 @@ TrailCurrentPeregrine/
 
 ### Fresh Board Setup
 
-Copy the repo to the Radxa board and run the setup script as root:
+Copy the repo to the Radxa board and run the setup script (as root):
 
 ```bash
 cd setup/
 chmod +x setup-board.sh
-sudo ./setup-board.sh
+./setup-board.sh
 ```
 
 This performs a complete provisioning:
@@ -81,32 +85,30 @@ For routine code and model updates, use the deploy script from your dev machine:
 ```bash
 ./deploy.sh <board-ip>
 # or with explicit user
-./deploy.sh assistant@192.168.1.100
+./deploy.sh root@192.168.1.100
 ```
 
-This copies `assistant.py`, the wake word model, and the systemd service file to the board, upgrades openwakeword, and reloads systemd. It creates a default `~/assistant.env` on first deploy but never overwrites it.
+The script connects as `root` (the `assistant` user has no password — it exists only to run the service). It copies `assistant.py`, the wake word model, and the systemd service file to the board, upgrades openwakeword, fixes file ownership, and reloads systemd. It creates a default `~/assistant.env` on first deploy but never overwrites it.
 
 After deploying, restart the service on the board:
 
 ```bash
-sudo systemctl restart voice-assistant
-sudo journalctl -u voice-assistant -f
+systemctl restart voice-assistant
+journalctl -u voice-assistant -f
 ```
 
 To re-run the full setup (e.g., after an OS update or to apply new hardening):
 
 ```bash
 cd setup/
-sudo ./setup-board.sh
+./setup-board.sh
 ```
 
 ### Verify Audio
 
-Switch to the assistant user and test hardware:
+Test audio hardware on the board (as root, or `su - assistant`):
 
 ```bash
-su - assistant
-
 # List audio devices
 aplay -l
 arecord -l
@@ -123,7 +125,7 @@ arecord -d 5 -f S16_LE -r 16000 /tmp/test.wav && aplay /tmp/test.wav
 To enable device control, edit the environment file on the board:
 
 ```bash
-nano ~/assistant.env
+nano /home/assistant/assistant.env
 ```
 
 Uncomment and fill in your MQTT broker details:
@@ -140,7 +142,7 @@ MQTT_PASSWORD=your_password
 Then restart the service:
 
 ```bash
-sudo systemctl restart voice-assistant
+systemctl restart voice-assistant
 ```
 
 Without MQTT configured, the assistant still works for general questions — device control commands will just report "not connected."
@@ -157,8 +159,8 @@ Say "Hey Peregrine" and ask a question or give a command.
 ### Enable as a Service
 
 ```bash
-sudo systemctl start voice-assistant
-sudo journalctl -u voice-assistant -f
+systemctl start voice-assistant
+journalctl -u voice-assistant -f
 ```
 
 ## Voice Commands
@@ -168,14 +170,20 @@ With MQTT connected, the assistant responds to:
 | Command | Example phrases |
 |---|---|
 | **Lights on/off** | "Turn on the lights", "Lights off", "Turn off light 3" |
+| **Light brightness** | "Set lights to 50 percent", "Dim light 2 to 25 percent" |
 | **Light status** | "Are the lights on?", "Which lights are on?" |
+| **Named devices** | "Turn on the water pump", "Turn off the awning light" |
+| **Relay status** | "What relays are on?", "Switch status" |
+| **Everything** | "Turn off everything", "Turn on all the lights" |
 | **Temperature** | "What's the temperature?", "How hot is it?" |
 | **Humidity** | "What's the humidity?" |
 | **Battery/energy** | "What's the battery level?", "How much solar?" |
 | **Location** | "Where are we?", "What's our location?" |
 | **General questions** | Anything else is answered by the LLM |
 
-Light commands and sensor queries use fast regex-based intent matching (no LLM round-trip). Unrecognized requests fall through to the LLM.
+Device commands and sensor queries use fast regex-based intent matching (no LLM round-trip). Unrecognized requests fall through to the LLM.
+
+Device names are configured in the TrailCurrent web UI and synced via MQTT. Both Torrent (PWM lights) and Switchback (relays) devices are supported. Only Torrent lights support brightness — Switchback relays are on/off only. When you say "turn off all the lights", both Torrent lights and any Switchback relays configured as type "light" are turned off.
 
 ## Configuration
 
@@ -202,7 +210,7 @@ All settings are controlled via environment variables. On the board, site-specif
 
 ## MQTT Topics
 
-The assistant subscribes to these topics for sensor data:
+The assistant subscribes to these topics for sensor data and device config:
 
 | Topic | Data |
 |---|---|
@@ -212,21 +220,26 @@ The assistant subscribes to these topics for sensor data:
 | `local/gps/latlon` | `{"latitude": float, "longitude": float}` |
 | `local/gps/time` | `{"year": int, "month": int, "day": int, "hour": int, "minute": int, "second": int}` (UTC) |
 | `local/gps/alt` | `{"altitudeInMeters": float, "altitudeFeet": int}` |
-| `local/lights/+/status` | `{"state": 0/1, "name": "..."}` |
+| `local/lights/+/status` | `{"state": 0/1, "name": "..."}` (Torrent lights) |
+| `local/relays/+/status` | `{"state": 0/1}` (Switchback relays) |
 | `local/thermostat/status` | Thermostat state |
+| `local/config/pdm_channels` | Torrent channel names/types (retained) |
+| `local/config/relay_channels` | Switchback channel names/types (retained) |
 
-For light commands, it publishes:
+For device commands, it publishes:
 
 | Topic | Payload |
 |---|---|
-| `local/lights/{id}/command` | `{"state": 0/1}` |
-| `can/outbound` | CAN frame for "all lights" broadcast |
+| `local/lights/{id}/command` | `{"state": 0/1}` (Torrent lights) |
+| `local/lights/{id}/brightness` | `{"brightness": 0-255}` (Torrent lights only) |
+| `local/relays/{channel}/command` | `{"state": 0/1}` (Switchback individual relay toggle) |
+| `local/relays/all/command` | `{"state": 0/1}` (Switchback all relays on/off) |
 
 ## Hardware
 
-- **Board**: Radxa Dragon Q6A (RK3588S SoC, 8 GB RAM)
+- **Board**: Radxa Dragon Q6A (Qualcomm QCS6490 SoC, 8 GB RAM)
 - **Audio**: USB microphone + speaker (auto-detected via ALSA, uses arecord/aplay)
-- **Storage**: eMMC or SD card with Ubuntu Noble 24.04
+- **Storage**: eMMC or SD card with Armbian Noble 24.04
 
 ## Wake Word Training
 
@@ -278,8 +291,8 @@ After training, copy the model to the board:
 ./deploy.sh <board-ip>
 
 # Or model-only update
-scp models/hey_peregrine.onnx* assistant@<board-ip>:~/models/
-ssh assistant@<board-ip> sudo systemctl restart voice-assistant
+scp models/hey_peregrine.onnx* root@<board-ip>:/home/assistant/models/
+ssh root@<board-ip> "chown assistant:assistant /home/assistant/models/hey_peregrine.onnx* && systemctl restart voice-assistant"
 ```
 
 ## Third-Party Licenses
