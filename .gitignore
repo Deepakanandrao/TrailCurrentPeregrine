@@ -70,3 +70,4 @@ training/real_clips_negative/
 # Stray audio/recording files in repo root
 long_recording*
 karen_*
+**/*.FCBak
