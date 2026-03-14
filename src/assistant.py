@@ -1787,6 +1787,23 @@ def transcribe(pcm_bytes):
         return " ".join(seg.text for seg in segments).strip()
 
 
+def _clean_llm_response(text):
+    """Strip meta-commentary that small LLMs append after the real answer."""
+    # Cut at lines that look like model self-commentary rather than answer content
+    meta_patterns = re.compile(
+        r'^(This is a JSON|Here is|Note:|```|{'
+        r'|\[{|"[a-z_]+"\s*:)',
+        re.IGNORECASE
+    )
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        if meta_patterns.match(line.strip()):
+            break
+        cleaned.append(line)
+    return '\n'.join(cleaned).strip() or text.strip()
+
+
 def ask_llm(prompt):
     """Send prompt to Ollama, return response text."""
     try:
@@ -1802,7 +1819,8 @@ def ask_llm(prompt):
             }
         }, timeout=60)
         resp.raise_for_status()
-        return resp.json().get("response", "Sorry, I didn't get a response.")
+        raw = resp.json().get("response", "Sorry, I didn't get a response.")
+        return _clean_llm_response(raw)
     except requests.exceptions.ConnectionError:
         return "Sorry, the language model is not running."
     except requests.exceptions.Timeout:
