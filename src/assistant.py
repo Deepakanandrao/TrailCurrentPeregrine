@@ -665,28 +665,46 @@ def _execute_light_command(light_id, state):
         light_ids = [did for did, dtype in _device_types_by_id.items() if dtype == "light"]
         if not light_ids:
             return "I don't know which lights are available yet."
+        sent = 0
         for lid in sorted(light_ids):
             relay_ch = _relay_channel_by_id.get(lid)
             if relay_ch is not None:
-                # Switchback relay typed as "light" — use relay topic
+                # Switchback relay typed as "light" — CAN toggles, check status
+                current = sensor_data.get(f"local/relays/{relay_ch}/status", {}).get("state")
+                if current is not None and current == state:
+                    name = _device_names_by_id.get(lid, f"relay {relay_ch}")
+                    print(f"  Skipping {name} (already {state_word} per MQTT status)")
+                    continue
                 topic = f"local/relays/{relay_ch}/command"
                 payload = json.dumps({"state": state})
                 mqtt.publish(topic, payload)
                 print(f"  MQTT publish: {topic} -> {payload}")
             else:
-                # PDM light — use lights topic
+                # PDM light — CAN toggles, check status
+                current = sensor_data.get(f"local/lights/{lid}/status", {}).get("state")
+                if current is not None and current == state:
+                    name = _device_names_by_id.get(lid, f"light {lid}")
+                    print(f"  Skipping {name} (already {state_word} per MQTT status)")
+                    continue
                 topic = f"local/lights/{lid}/command"
                 payload = json.dumps({"state": state})
                 mqtt.publish(topic, payload)
                 print(f"  MQTT publish: {topic} -> {payload}")
+            sent += 1
+        if sent == 0:
+            return f"All lights are already {state_word}."
         return f"Turning {state_word} all lights."
     else:
+        name = _device_names_by_id.get(int(light_id), f"light {light_id}")
+        # CAN commands are toggles — check MQTT status to avoid toggling wrong way
+        current = sensor_data.get(f"local/lights/{light_id}/status", {}).get("state")
+        if current is not None and current == state:
+            print(f"  Skipping {name} (already {state_word} per MQTT status)")
+            return f"{name} is already {state_word}."
         topic = f"local/lights/{light_id}/command"
         payload = json.dumps({"state": state})
         mqtt.publish(topic, payload)
-
         print(f"  MQTT publish: {topic} -> {payload}")
-        name = _device_names_by_id.get(int(light_id), f"light {light_id}")
         return f"Turning {state_word} {name}."
 
 
@@ -733,6 +751,11 @@ def _execute_device_command(device_id, device_name, device_type, state):
         return _execute_relay_command(device_id, device_name, state, relay_ch)
 
     state_word = "on" if state else "off"
+    # CAN commands are toggles — check MQTT status to avoid toggling wrong way
+    current = sensor_data.get(f"local/lights/{device_id}/status", {}).get("state")
+    if current is not None and current == state:
+        print(f"  Skipping {device_name} (already {state_word} per MQTT status)")
+        return f"The {device_name} is already {state_word}."
     topic = f"local/lights/{device_id}/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
@@ -743,9 +766,10 @@ def _execute_device_command(device_id, device_name, device_type, state):
 def _execute_relay_command(device_id, device_name, state, relay_channel=None):
     """Send a relay on/off command via MQTT.
 
-    Individual relays are toggled via local/relays/{channel}/command.
-    The Switchback CAN protocol only supports toggle for individual relays,
-    so we check current state and skip if already in the desired state.
+    Individual relay commands are toggles on CAN — sending a command to a
+    relay that is already in the desired state will toggle it the wrong way.
+    We check the real MQTT status (published by the device) before sending.
+    If we have no status data we send anyway (better to try than ignore).
     """
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
@@ -756,6 +780,13 @@ def _execute_relay_command(device_id, device_name, state, relay_channel=None):
     if relay_channel is None:
         return f"Sorry, I don't know the relay channel for {device_name}."
 
+    # Guard: skip if device already reports the desired state (avoid toggle)
+    status_topic = f"local/relays/{relay_channel}/status"
+    current = sensor_data.get(status_topic, {}).get("state")
+    if current is not None and current == state:
+        print(f"  Skipping {device_name} (already {state_word} per MQTT status)")
+        return f"The {device_name} is already {state_word}."
+
     topic = f"local/relays/{relay_channel}/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
@@ -764,7 +795,11 @@ def _execute_relay_command(device_id, device_name, state, relay_channel=None):
 
 
 def _execute_relay_all_command(state):
-    """Send all-relays on/off command via MQTT."""
+    """Send all-relays on/off command via MQTT.
+
+    Sends individual relay commands (not bulk) so we can check each relay's
+    current state and skip those already in the desired state (CAN toggles).
+    """
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
     state_word = "on" if state else "off"
@@ -772,10 +807,20 @@ def _execute_relay_all_command(state):
     if not _relay_channel_by_id:
         return "I don't know which relays are available yet."
 
-    topic = "local/relays/all/command"
-    payload = json.dumps({"state": state})
-    mqtt.publish(topic, payload)
-    print(f"  MQTT publish: {topic} -> {payload}")
+    sent = 0
+    for dev_id, relay_ch in _relay_channel_by_id.items():
+        current = sensor_data.get(f"local/relays/{relay_ch}/status", {}).get("state")
+        if current is not None and current == state:
+            name = _device_names_by_id.get(dev_id, f"relay {relay_ch}")
+            print(f"  Skipping {name} (already {state_word} per MQTT status)")
+            continue
+        topic = f"local/relays/{relay_ch}/command"
+        payload = json.dumps({"state": state})
+        mqtt.publish(topic, payload)
+        print(f"  MQTT publish: {topic} -> {payload}")
+        sent += 1
+    if sent == 0:
+        return f"All relays are already {state_word}."
     return f"Turning {state_word} all relays."
 
 
