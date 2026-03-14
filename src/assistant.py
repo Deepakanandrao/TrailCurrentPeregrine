@@ -247,7 +247,7 @@ def _play_raw_audio(raw_bytes, sample_rate=22050, channels=1):
             pass
 
 
-def _generate_beep_wav(path, freq=800, duration=0.4, sample_rate=16000):
+def _generate_beep_wav(path, freq=440, duration=0.4, sample_rate=48000):
     """Write a beep tone as a WAV file (S16_LE mono).
 
     Includes a short silence lead-in so the USB audio device has time to

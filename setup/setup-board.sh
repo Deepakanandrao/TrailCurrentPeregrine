@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Voice Assistant — Board Setup & Hardening
-# For Radxa Dragon Q6A (RK3588S, Ubuntu Noble 24.04, 8 GB RAM)
+# For Radxa Dragon Q6A (Qualcomm QCS6490, Ubuntu Noble 24.04, 8 GB RAM)
 #
 # Combines provisioning (packages, users, models) with system hardening
-# (disable desktop, tune CPU/Ollama, power-down unused hardware).
+# (disable desktop, tune CPU, power-down unused hardware).
 #
 # Idempotent — safe to re-run on a fresh board or an existing one.
 # Each step checks whether work is already done and skips if so.
+#
+# Prerequisites:
+#   - Radxa OS R2 (Noble) flashed to the board (see docs/board-setup.md)
+#   - Board connected to the network with SSH access as root
 #
 # Fresh board:
 #   chmod +x setup-board.sh && sudo ./setup-board.sh
@@ -16,7 +20,7 @@
 #   sudo ./setup-board.sh
 #
 # After setup, deploy application code from your dev machine:
-#   ./deploy.sh assistant@<board-ip>
+#   ./deploy.sh <board-ip>
 # ============================================================================
 
 set -uo pipefail
@@ -24,10 +28,10 @@ set -uo pipefail
 ASSISTANT_USER="assistant"
 ASSISTANT_HOME="/home/${ASSISTANT_USER}"
 VENV_DIR="${ASSISTANT_HOME}/assistant-env"
-OLLAMA_MODEL="qwen2.5:0.5b"
 PIPER_VOICE="en_US-libritts_r-medium"
 PIPER_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/libritts_r/medium"
 PIPER_DIR="${ASSISTANT_HOME}/piper-voices"
+NPU_MODEL_DIR="${ASSISTANT_HOME}/Qwen2.5-0.5B-v68"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,18 +53,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo ""
 echo "============================================"
 echo "  Voice Assistant — Board Setup & Hardening"
+echo "  Radxa Dragon Q6A (QCS6490)"
 echo "============================================"
 echo ""
 
 # ============================================================================
-# 1. System packages
+# 1. Radxa QCS6490 apt repository (for NPU packages)
 # ============================================================================
-log "1. System packages"
+log "1. Radxa QCS6490 apt repository"
 
-apt update -y || step_fail "apt update failed"
-apt upgrade -y || warn "apt upgrade had issues (continuing)"
+if [[ -f /etc/apt/sources.list.d/70-qcs6490-noble.list ]]; then
+    log "  Radxa QCS6490 repo already configured"
+else
+    log "  Adding Radxa QCS6490 repository..."
+    curl -s https://radxa-repo.github.io/qcs6490-noble/install.sh | sh \
+        || step_fail "Failed to add Radxa QCS6490 repo"
+fi
 
-apt install -y \
+# ============================================================================
+# 2. System packages
+# ============================================================================
+log "2. System packages"
+
+apt-get update -y || step_fail "apt update failed"
+apt-get upgrade -y || warn "apt upgrade had issues (continuing)"
+
+apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
@@ -77,73 +95,69 @@ apt install -y \
 || step_fail "Some packages failed to install"
 
 # ============================================================================
-# 2. Create dedicated user
+# 3. NPU packages (Qualcomm Hexagon DSP via FastRPC)
 # ============================================================================
-log "2. Assistant user"
+log "3. NPU packages (FastRPC / libcdsprpc)"
+
+apt-get install -y fastrpc libcdsprpc1 \
+    || step_fail "Failed to install NPU packages (fastrpc, libcdsprpc1)"
+
+# Verify the CDSP remoteproc is running
+if [[ -d /sys/class/remoteproc ]]; then
+    for rp in /sys/class/remoteproc/remoteproc*/; do
+        fw=$(cat "${rp}firmware" 2>/dev/null || true)
+        state=$(cat "${rp}state" 2>/dev/null || true)
+        if echo "$fw" | grep -q cdsp; then
+            if [[ "$state" == "running" ]]; then
+                log "  CDSP remoteproc: running ($fw)"
+            else
+                warn "  CDSP remoteproc state: $state (expected 'running')"
+            fi
+        fi
+    done
+fi
+
+# ============================================================================
+# 4. Create dedicated user
+# ============================================================================
+log "4. Assistant user"
 
 if id "${ASSISTANT_USER}" &>/dev/null; then
     log "  User '${ASSISTANT_USER}' already exists"
 else
-    useradd -m -s /bin/bash -G audio "${ASSISTANT_USER}" \
+    useradd -m -s /bin/bash -G audio,render "${ASSISTANT_USER}" \
         || step_fail "Failed to create user '${ASSISTANT_USER}'"
 fi
 
-usermod -aG audio "${ASSISTANT_USER}" 2>/dev/null || true
+usermod -aG audio,render "${ASSISTANT_USER}" 2>/dev/null || true
 
 # ============================================================================
-# 3. Ollama
+# 5. NPU LLM model (Qwen2.5-0.5B for Hexagon v68)
 # ============================================================================
-log "3. Ollama"
+log "5. NPU LLM model (Qwen2.5-0.5B-v68)"
 
-if command -v ollama &>/dev/null; then
-    log "  Ollama already installed"
+if [[ -f "${NPU_MODEL_DIR}/genie-t2t-run" && -d "${NPU_MODEL_DIR}/models" ]]; then
+    log "  NPU model already downloaded at ${NPU_MODEL_DIR}"
 else
-    curl -fsSL https://ollama.com/install.sh | sh || step_fail "Ollama install failed"
+    log "  Installing modelscope..."
+    pip3 install --break-system-packages -q modelscope 2>/dev/null \
+        || step_fail "Failed to install modelscope"
+
+    log "  Downloading Qwen2.5-0.5B-v68 from ModelScope (this will take a while)..."
+    modelscope download --model radxa/Qwen2.5-0.5B-v68 --local "${NPU_MODEL_DIR}" \
+        || step_fail "Failed to download NPU model"
 fi
 
-systemctl enable ollama 2>/dev/null || true
-systemctl start ollama 2>/dev/null || true
-
-# Tune Ollama for RK3588S before pulling model
-mkdir -p /etc/systemd/system/ollama.service.d
-cat > /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
-[Service]
-# Use all 8 cores for inference
-Environment=OLLAMA_NUM_THREADS=8
-# Keep models loaded indefinitely (assistant is the only consumer)
-Environment=OLLAMA_KEEP_ALIVE=-1
-# Bind to localhost only
-Environment=OLLAMA_HOST=127.0.0.1:11434
-EOF
-systemctl daemon-reload
-systemctl restart ollama 2>/dev/null || true
-log "  Ollama tuned: 8 threads, keep_alive=-1"
-
-log "  Waiting for Ollama API..."
-OLLAMA_READY=false
-for i in $(seq 1 30); do
-    if curl -s http://localhost:11434/api/tags &>/dev/null; then
-        OLLAMA_READY=true
-        break
-    fi
-    sleep 2
-done
-
-if [[ "${OLLAMA_READY}" == "true" ]]; then
-    if ollama list | grep -q "${OLLAMA_MODEL%%:*}"; then
-        log "  Model '${OLLAMA_MODEL}' already pulled"
-    else
-        log "  Pulling model: ${OLLAMA_MODEL} (this will take a while)..."
-        ollama pull "${OLLAMA_MODEL}" || step_fail "Failed to pull Ollama model"
-    fi
-else
-    step_fail "Ollama API not reachable after 60s"
+# Ensure genie-t2t-run is executable
+if [[ -f "${NPU_MODEL_DIR}/genie-t2t-run" ]]; then
+    chmod +x "${NPU_MODEL_DIR}/genie-t2t-run"
+    log "  genie-t2t-run is ready"
 fi
 
 # ============================================================================
-# 4. Python virtual environment and packages
+# 6. Python virtual environment and packages
 # ============================================================================
-log "4. Python virtual environment"
+log "6. Python virtual environment"
 
 if [[ -x "${VENV_DIR}/bin/python3" ]]; then
     log "  Venv already exists at ${VENV_DIR}"
@@ -159,14 +173,28 @@ if [[ -x "${VENV_DIR}/bin/python3" ]]; then
         piper-tts \
         paho-mqtt \
         numpy \
+        scipy \
+        scikit-learn \
+        pathvalidate \
         requests \
         timezonefinder \
     || step_fail "Some Python packages failed to install"
 
     # openwakeword installed separately with --no-deps because tflite-runtime
     # has no aarch64 wheel. We only use ONNX inference so tflite is not needed.
-    "${VENV_DIR}/bin/pip" install --no-deps openwakeword \
+    # --force-reinstall ensures resource files (melspectrogram.onnx, embedding_model.onnx)
+    # are included even when upgrading across major versions.
+    "${VENV_DIR}/bin/pip" install --force-reinstall --no-deps openwakeword \
     || step_fail "openwakeword install failed"
+
+    # Download openwakeword resource models (melspectrogram.onnx, embedding_model.onnx)
+    # These are not included in the wheel and must be downloaded separately.
+    log "  Downloading openwakeword resource models..."
+    "${VENV_DIR}/bin/python3" -c "
+import openwakeword
+openwakeword.utils.download_models()
+print('  Resource models downloaded')
+" || warn "openwakeword resource model download failed (non-fatal)"
 
     log "  Verifying wake word model loads..."
     "${VENV_DIR}/bin/python3" -c "
@@ -178,9 +206,9 @@ del m
 fi
 
 # ============================================================================
-# 5. Custom wake word model
+# 7. Custom wake word model
 # ============================================================================
-log "5. Custom wake word model (hey_peregrine)"
+log "7. Custom wake word model (hey_peregrine)"
 
 WAKE_MODEL_DIR="${ASSISTANT_HOME}/models"
 mkdir -p "${WAKE_MODEL_DIR}"
@@ -194,9 +222,9 @@ else
 fi
 
 # ============================================================================
-# 6. Piper TTS voice
+# 8. Piper TTS voice
 # ============================================================================
-log "6. Piper TTS voice"
+log "8. Piper TTS voice"
 
 mkdir -p "${PIPER_DIR}"
 
@@ -213,15 +241,41 @@ else
 fi
 
 # ============================================================================
-# 7. systemd service
+# 9. systemd services (genie-server + voice-assistant)
 # ============================================================================
-log "7. systemd service"
+log "9. systemd services"
 
+# Genie NPU server — thin HTTP wrapper around genie-t2t-run
+# No hardening (ProtectSystem etc.) — it breaks DSP access via /dev/fastrpc-*
+cat > /etc/systemd/system/genie-server.service << EOF
+[Unit]
+Description=Genie NPU LLM Server (Qwen2.5-0.5B on Hexagon DSP)
+After=network.target
+
+[Service]
+Type=simple
+User=${ASSISTANT_USER}
+Group=audio
+SupplementaryGroups=render
+WorkingDirectory=${ASSISTANT_HOME}
+ExecStart=/usr/bin/python3 ${ASSISTANT_HOME}/genie_server.py
+Restart=on-failure
+RestartSec=5
+
+Environment=HOME=${ASSISTANT_HOME}
+Environment=PYTHONUNBUFFERED=1
+Environment=GENIE_DIR=${NPU_MODEL_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Voice assistant — depends on genie-server for LLM inference
 cat > /etc/systemd/system/voice-assistant.service << EOF
 [Unit]
 Description=Local Voice Assistant
-After=network.target sound.target ollama.service
-Wants=ollama.service
+After=network.target sound.target genie-server.service
+Wants=genie-server.service
 
 [Service]
 Type=simple
@@ -254,8 +308,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+systemctl enable genie-server 2>/dev/null || true
 systemctl enable voice-assistant 2>/dev/null || true
-log "  Service installed and enabled"
+log "  Services installed and enabled"
 
 # Create default env file if it doesn't exist (never overwrite)
 if [[ ! -f "${ASSISTANT_HOME}/assistant.env" ]]; then
@@ -283,16 +338,16 @@ else
 fi
 
 # ============================================================================
-# 8. File ownership
+# 10. File ownership
 # ============================================================================
-log "8. File ownership"
+log "10. File ownership"
 
 chown -R "${ASSISTANT_USER}:${ASSISTANT_USER}" "${ASSISTANT_HOME}"
 
 # ============================================================================
-# 9. Disable graphical desktop
+# 11. Disable graphical desktop
 # ============================================================================
-log "9. Disable graphical desktop"
+log "11. Disable graphical desktop"
 
 if systemctl get-default | grep -q graphical; then
     systemctl set-default multi-user.target
@@ -309,9 +364,9 @@ for dm in gdm3 gdm lightdm sddm; do
 done
 
 # ============================================================================
-# 10. Disable unnecessary services
+# 12. Disable unnecessary services
 # ============================================================================
-log "10. Disable unnecessary services"
+log "12. Disable unnecessary services"
 
 DISABLE_SERVICES=(
     accounts-daemon
@@ -343,9 +398,9 @@ for svc in "${DISABLE_SERVICES[@]}"; do
 done
 
 # ============================================================================
-# 11. Disable PulseAudio / PipeWire (assistant uses ALSA directly)
+# 13. Disable PulseAudio / PipeWire (assistant uses ALSA directly)
 # ============================================================================
-log "11. Disable PulseAudio/PipeWire"
+log "13. Disable PulseAudio/PipeWire"
 
 for svc in pulseaudio pipewire pipewire-pulse wireplumber; do
     systemctl --global disable "$svc.service" "$svc.socket" 2>/dev/null || true
@@ -374,9 +429,9 @@ loginctl enable-linger "${ASSISTANT_USER}" 2>/dev/null || warn "enable-linger fa
 log "  Audio daemons disabled, autospawn blocked"
 
 # ============================================================================
-# 12. Kernel / sysctl tuning
+# 14. Kernel / sysctl tuning
 # ============================================================================
-log "12. Kernel tuning"
+log "14. Kernel tuning"
 
 cat > /etc/sysctl.d/90-assistant.conf << 'EOF'
 # Reduce swap pressure — keep inference models in RAM
@@ -386,7 +441,7 @@ vm.swappiness = 10
 vm.dirty_ratio = 20
 vm.dirty_background_ratio = 5
 
-# Increase inotify limits (Ollama model loading)
+# Increase inotify limits
 fs.inotify.max_user_watches = 65536
 
 # Reduce kernel log verbosity
@@ -397,9 +452,9 @@ sysctl --system > /dev/null 2>&1
 log "  Applied sysctl tuning"
 
 # ============================================================================
-# 13. CPU governor — performance
+# 15. CPU governor — performance
 # ============================================================================
-log "13. CPU governor"
+log "15. CPU governor"
 
 if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
     for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -427,15 +482,15 @@ else
 fi
 
 # ============================================================================
-# 14. Remove snap
+# 16. Remove snap
 # ============================================================================
-log "14. Remove snap"
+log "16. Remove snap"
 
 if command -v snap &>/dev/null; then
     snap list 2>/dev/null | tail -n+2 | awk '{print $1}' | while read -r pkg; do
         snap remove --purge "$pkg" 2>/dev/null || true
     done
-    apt remove -y --purge snapd 2>/dev/null || true
+    apt-get remove -y --purge snapd 2>/dev/null || true
     rm -rf /snap /var/snap /var/lib/snapd
     log "  Snap removed"
 else
@@ -443,9 +498,9 @@ else
 fi
 
 # ============================================================================
-# 15. Clean up unnecessary packages
+# 17. Clean up desktop packages
 # ============================================================================
-log "15. Package cleanup"
+log "17. Package cleanup"
 
 REMOVE_PKGS=""
 for pkg in xserver-xorg x11-common gnome-shell ubuntu-desktop firefox thunderbird libreoffice-core; do
@@ -462,13 +517,13 @@ else
     log "  No desktop packages to remove"
 fi
 
-apt autoremove -y 2>/dev/null || true
-apt clean 2>/dev/null || true
+apt-get autoremove -y 2>/dev/null || true
+apt-get clean 2>/dev/null || true
 
 # ============================================================================
-# 16. RK3588S power: disable unused hardware
+# 18. QCS6490 power: disable unused hardware
 # ============================================================================
-log "16. Disable unused RK3588S hardware (GPU, NPU, HDMI, video codecs)"
+log "18. Disable unused QCS6490 hardware (GPU, HDMI, video codecs)"
 
 # USB runtime power management (skip audio devices — they must stay awake)
 for dev in /sys/bus/usb/devices/*/power/control; do
@@ -492,8 +547,8 @@ for dev in /sys/bus/usb/devices/*/power/control; do
 done
 log "  USB runtime power management: auto (audio devices excluded)"
 
-# GPU (Mali G610 MP4) — lock to minimum frequency, unbind driver
-for gpu in /sys/class/devfreq/*gpu*; do
+# GPU (Adreno 643) — lock to minimum frequency if devfreq is available
+for gpu in /sys/class/devfreq/*gpu* /sys/class/devfreq/*3d00000*; do
     if [[ -f "$gpu/governor" ]]; then
         echo powersave > "$gpu/governor" 2>/dev/null && \
             log "  GPU devfreq governor: powersave"
@@ -508,7 +563,8 @@ for gpu in /sys/class/devfreq/*gpu*; do
     fi
 done
 
-# Unbind unused platform drivers
+# Unbind unused platform drivers (QCS6490-specific)
+# NOTE: Do NOT unbind fastrpc or cdsp — the NPU needs them!
 _unbind_driver() {
     local drv_path="/sys/bus/platform/drivers/$1"
     local label="$2"
@@ -523,16 +579,13 @@ _unbind_driver() {
     fi
 }
 
-_unbind_driver panfrost    "GPU"
-_unbind_driver panthor     "GPU"
-_unbind_driver rknpu       "NPU"
-_unbind_driver rkvdec2     "video decoder"
-_unbind_driver rkvenc      "video encoder"
-_unbind_driver hantro-vpu  "video codec"
-_unbind_driver rkisp       "camera ISP"
-_unbind_driver dw-hdmi-qp-rockchip "HDMI"
-_unbind_driver dwhdmi-rockchip     "HDMI"
-_unbind_driver rockchip-vop2       "display controller"
+# Display and video (headless — not needed)
+_unbind_driver msm_dsi     "display DSI"
+_unbind_driver msm_dp      "DisplayPort"
+_unbind_driver msm_mdss    "display controller"
+
+# Camera (not used)
+_unbind_driver camss       "camera subsystem"
 
 # WiFi power save
 iw dev 2>/dev/null | grep Interface | awk '{print $2}' | while read -r iface; do
@@ -543,19 +596,18 @@ done
 # Persist hardware power-down across reboots
 cat > /etc/systemd/system/power-save-hw.service << 'PWREOF'
 [Unit]
-Description=Disable unused RK3588S hardware for power savings
+Description=Disable unused QCS6490 hardware for power savings
 After=multi-user.target
 
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -c '\
-  for gpu in /sys/class/devfreq/*gpu*; do \
+  for gpu in /sys/class/devfreq/*gpu* /sys/class/devfreq/*3d00000*; do \
     [ -f "$gpu/governor" ] && echo powersave > "$gpu/governor"; \
     min=$(awk "{print \\$1}" "$gpu/available_frequencies" 2>/dev/null); \
     [ -n "$min" ] && echo "$min" > "$gpu/max_freq" && echo "$min" > "$gpu/min_freq"; \
   done; \
-  for drv in panfrost panthor rknpu rkvdec2 rkvenc hantro-vpu rkisp \
-             dw-hdmi-qp-rockchip dwhdmi-rockchip rockchip-vop2; do \
+  for drv in msm_dsi msm_dp msm_mdss camss; do \
     d="/sys/bus/platform/drivers/$drv"; [ -d "$d" ] && \
     for dev in "$d"/*/; do n=$(basename "$dev"); \
       [ "$n" != module ] && [ "$n" != uevent ] && echo "$n" > "$d/unbind" 2>/dev/null; \
@@ -580,6 +632,20 @@ systemctl enable power-save-hw 2>/dev/null
 log "  Hardware power-down service installed (persists across reboots)"
 
 # ============================================================================
+# 19. Set hostname
+# ============================================================================
+log "19. Hostname"
+
+CURRENT_HOSTNAME=$(hostname)
+DESIRED_HOSTNAME="radxa-dragon-q6a"
+if [[ "$CURRENT_HOSTNAME" != "$DESIRED_HOSTNAME" ]]; then
+    hostnamectl set-hostname "$DESIRED_HOSTNAME"
+    log "  Hostname set to $DESIRED_HOSTNAME (was $CURRENT_HOSTNAME)"
+else
+    log "  Hostname already $DESIRED_HOSTNAME"
+fi
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo ""
@@ -598,7 +664,7 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "  1. Deploy assistant code from your dev machine:"
-echo "     ./deploy.sh ${ASSISTANT_USER}@<board-ip>"
+echo "     ./deploy.sh <board-ip>"
 echo ""
 echo "  2. Configure MQTT on the board:"
 echo "     nano ${ASSISTANT_HOME}/assistant.env"
@@ -613,17 +679,21 @@ echo ""
 echo "Test commands:"
 echo ""
 echo "  # Test speaker"
-echo "  speaker-test -D plughw:0,0 -t wav -c 2 -l 1"
+echo "  speaker-test -t wav -c 2 -l 1"
 echo ""
 echo "  # Test microphone (record 5 sec, play back)"
-echo "  arecord -D plughw:0,0 -d 5 -f S16_LE -r 16000 /tmp/test.wav && \\"
-echo "    aplay -D plughw:0,0 /tmp/test.wav"
+echo "  arecord -d 5 -f S16_LE -r 16000 /tmp/test.wav && aplay /tmp/test.wav"
 echo ""
 echo "  # Test Piper TTS"
 echo "  echo 'Hello, I am your voice assistant.' | \\"
 echo "    ${VENV_DIR}/bin/piper --model ${PIPER_DIR}/${PIPER_VOICE}.onnx --output-raw | \\"
-echo "    aplay -D plughw:0,0 -r 22050 -f S16_LE -c 1"
+echo "    aplay -r 22050 -f S16_LE -c 1"
 echo ""
-echo "  # Test Ollama"
-echo "  ollama run ${OLLAMA_MODEL} 'Say hello in one sentence'"
+echo "  # Test NPU inference (Qwen2.5-0.5B on Hexagon DSP)"
+echo "  cd ${NPU_MODEL_DIR} && export LD_LIBRARY_PATH=\$(pwd) && \\"
+echo "    ./genie-t2t-run -c qwen2.5-0.5B-1k-htp.json \\"
+echo "    -p '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n'"
+echo ""
+echo "  # Test genie server (NPU LLM over HTTP)"
+echo "  curl -s http://localhost:11434/api/generate -d '{\"prompt\":\"Say hello\",\"system\":\"Reply in one sentence.\"}' | python3 -m json.tool"
 echo ""

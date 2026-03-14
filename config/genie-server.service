@@ -1,0 +1,20 @@
+[Unit]
+Description=Genie NPU LLM Server (Qwen2.5-0.5B on Hexagon DSP)
+After=network.target
+
+[Service]
+Type=simple
+User=assistant
+Group=audio
+SupplementaryGroups=render
+WorkingDirectory=/home/assistant
+ExecStart=/usr/bin/python3 /home/assistant/genie_server.py
+Restart=on-failure
+RestartSec=5
+
+Environment=HOME=/home/assistant
+Environment=PYTHONUNBUFFERED=1
+Environment=GENIE_DIR=/home/assistant/Qwen2.5-0.5B-v68
+
+[Install]
+WantedBy=multi-user.target

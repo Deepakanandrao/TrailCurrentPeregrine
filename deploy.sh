@@ -47,7 +47,7 @@ SSH="ssh -o ControlPath=$SOCK"
 $SSH "$TARGET" "mkdir -p ${REMOTE_HOME}/models"
 
 # Ensure Python dependencies are up to date (run as assistant user)
-echo "[1/4] Checking Python dependencies..."
+echo "[1/5] Checking Python dependencies..."
 # --no-deps: tflite-runtime has no aarch64 wheel and we only use ONNX inference.
 # --force-reinstall ensures resource files (melspectrogram.onnx, embedding_model.onnx)
 # are included even when upgrading across major versions.
@@ -56,20 +56,25 @@ $SSH "$TARGET" "su -c '${REMOTE_HOME}/assistant-env/bin/pip install -q --force-r
 $SSH "$TARGET" "su -c '${REMOTE_HOME}/assistant-env/bin/pip install -q timezonefinder 2>&1 | tail -1' assistant"
 
 # Copy assistant.py
-echo "[2/4] Copying assistant.py..."
+echo "[2/5] Copying assistant.py..."
 $SCP "${SCRIPT_DIR}/src/assistant.py" "${TARGET}:${REMOTE_HOME}/assistant.py"
 
+# Copy genie NPU server
+echo "[3/5] Copying genie_server.py..."
+$SCP "${SCRIPT_DIR}/src/genie_server.py" "${TARGET}:${REMOTE_HOME}/genie_server.py"
+
 # Copy wake word model
-echo "[3/4] Copying wake word model..."
+echo "[4/5] Copying wake word model..."
 $SCP "${SCRIPT_DIR}/models/hey_peregrine.onnx" "${TARGET}:${REMOTE_HOME}/models/hey_peregrine.onnx"
 if [[ -f "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" ]]; then
     $SCP "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" "${TARGET}:${REMOTE_HOME}/models/hey_peregrine.onnx.data"
 fi
 
-# Copy service file and fix ownership (deploying as root, service runs as assistant)
-echo "[4/4] Copying service file..."
+# Copy service files and fix ownership (deploying as root, services run as assistant)
+echo "[5/5] Copying service files..."
 $SCP "${SCRIPT_DIR}/config/voice-assistant.service" "${TARGET}:/etc/systemd/system/voice-assistant.service"
-$SSH "$TARGET" "systemctl daemon-reload && chown -R assistant:assistant ${REMOTE_HOME}"
+$SCP "${SCRIPT_DIR}/config/genie-server.service" "${TARGET}:/etc/systemd/system/genie-server.service"
+$SSH "$TARGET" "systemctl daemon-reload && systemctl enable genie-server && chown -R assistant:assistant ${REMOTE_HOME}"
 
 # Create default env file if it doesn't exist (never overwrite)
 $SSH "$TARGET" "test -f ${REMOTE_HOME}/assistant.env || cat > ${REMOTE_HOME}/assistant.env << 'ENVEOF'
@@ -94,9 +99,11 @@ ENVEOF"
 echo ""
 echo "Deploy complete. Files copied:"
 echo "  ${REMOTE_HOME}/assistant.py"
+echo "  ${REMOTE_HOME}/genie_server.py"
 echo "  ${REMOTE_HOME}/models/hey_peregrine.onnx"
 echo "  ${REMOTE_HOME}/models/hey_peregrine.onnx.data"
 echo "  /etc/systemd/system/voice-assistant.service"
+echo "  /etc/systemd/system/genie-server.service"
 echo ""
 
 # Show current env config

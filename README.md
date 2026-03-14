@@ -1,6 +1,6 @@
 # TrailCurrentPeregrine
 
-Local voice assistant for the TrailCurrent platform, running on a Radxa Dragon Q6A (Qualcomm QCS6490, 8 GB RAM, Armbian Noble 24.04).
+Local voice assistant for the TrailCurrent platform, running on a Radxa Dragon Q6A (Qualcomm QCS6490, 8 GB RAM, Radxa OS Noble 24.04).
 
 <p align="center">
   <img src="CAD/peregrine_case.png" alt="TrailCurrentPeregrine case" width="480">
@@ -12,7 +12,7 @@ The assistant runs an entirely offline voice pipeline:
 
 1. **Wake word** — openWakeWord (custom `hey_peregrine` model)
 2. **Speech-to-text** — faster-whisper (`base.en`, INT8 on CPU)
-3. **LLM** — Ollama with Qwen 2.5 0.5B (fits in ~1 GB RAM)
+3. **LLM** — Qwen 2.5 0.5B on Hexagon NPU via genie-t2t-run (~29 tok/s)
 4. **Text-to-speech** — Piper TTS (`en_US-libritts_r-medium`)
 5. **Device control** — MQTT integration with TrailCurrent (lights, relays, sensors)
 
@@ -23,9 +23,11 @@ All processing happens on-device. No cloud services required.
 ```
 TrailCurrentPeregrine/
 ├── src/
-│   └── assistant.py                  # Main voice assistant loop
+│   ├── assistant.py                  # Main voice assistant loop
+│   └── genie_server.py              # NPU LLM HTTP server (Ollama-compatible API)
 ├── config/
 │   ├── voice-assistant.service       # systemd unit file
+│   ├── genie-server.service          # NPU LLM server systemd unit
 │   └── pulse-default.pa              # PulseAudio config (disabled by setup)
 ├── setup/
 │   └── setup-board.sh                # Board provisioning & hardening (idempotent)
@@ -39,6 +41,7 @@ TrailCurrentPeregrine/
 │   ├── record_wake_word.py           # Record positive & negative clips for training
 │   ├── generate_tts_variants.py      # Generate voice-cloned TTS training clips
 │   ├── generate_negative_clips.py    # Generate negative phrase TTS clips
+│   ├── record_ambient_negatives.py  # Record real ambient noise from a mic (30 min default)
 │   ├── generate_ambient_negatives.py # Generate/download ambient noise negatives
 │   ├── build_ambient_features.py     # Featurize ambient clips to .npy for training
 │   ├── real_clips/                   # Recorded wake word samples (positive)
@@ -66,13 +69,14 @@ chmod +x setup-board.sh
 
 This performs a complete provisioning:
 - Installs system packages (Python, ffmpeg, ALSA, etc.)
-- Creates the `assistant` user (added to `audio` group)
-- Installs and tunes Ollama (8 threads, keep_alive=-1, localhost-only)
+- Installs NPU packages (fastrpc, libcdsprpc for Hexagon DSP access)
+- Creates the `assistant` user (added to `audio` and `render` groups)
+- Downloads the NPU LLM model (Qwen2.5-0.5B for Hexagon v68)
 - Creates a Python venv with all dependencies
 - Downloads the Piper TTS voice model
 - Deploys the custom wake word model
-- Registers and enables the systemd service
-- Hardens the board (disables desktop, GPU, NPU, HDMI, snap, unnecessary services)
+- Installs systemd services (genie-server + voice-assistant)
+- Hardens the board (disables desktop, GPU, HDMI, snap, unnecessary services)
 - Sets CPU governor to performance
 - Tunes kernel parameters (swappiness, dirty pages)
 
@@ -88,7 +92,7 @@ For routine code and model updates, use the deploy script from your dev machine:
 ./deploy.sh root@192.168.1.100
 ```
 
-The script connects as `root` (the `assistant` user has no password — it exists only to run the service). It copies `assistant.py`, the wake word model, and the systemd service file to the board, upgrades openwakeword, fixes file ownership, and reloads systemd. It creates a default `~/assistant.env` on first deploy but never overwrites it.
+The script connects as `root` (the `assistant` user has no password — it exists only to run the service). It copies `assistant.py`, `genie_server.py`, the wake word model, and the systemd service files to the board, upgrades openwakeword, fixes file ownership, and reloads systemd. It creates a default `~/assistant.env` on first deploy but never overwrites it.
 
 After deploying, restart the service on the board:
 
@@ -195,8 +199,7 @@ All settings are controlled via environment variables. On the board, site-specif
 | `WAKE_MODEL_PATH` | *(auto-detected)* | Path to custom `.onnx` wake word model |
 | `WAKE_THRESHOLD` | `0.8` | Wake word detection threshold (0.0–1.0) |
 | `WHISPER_SIZE` | `base.en` | Whisper model size |
-| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Ollama model tag |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_URL` | `http://localhost:11434` | LLM API endpoint (genie server) |
 | `PIPER_MODEL` | `~/piper-voices/en_US-libritts_r-medium.onnx` | Path to Piper voice model |
 | `SILENCE_THRESHOLD` | `500` | Amplitude below which audio is silence |
 | `SILENCE_DURATION` | `1.5` | Seconds of silence before stopping recording |
@@ -238,8 +241,9 @@ For device commands, it publishes:
 ## Hardware
 
 - **Board**: Radxa Dragon Q6A (Qualcomm QCS6490 SoC, 8 GB RAM)
+- **NPU**: Hexagon DSP v68 (12 TOPS) — runs LLM inference at ~29 tok/s
 - **Audio**: USB microphone + speaker (auto-detected via ALSA, uses arecord/aplay)
-- **Storage**: eMMC or SD card with Armbian Noble 24.04
+- **Storage**: M.2 2230 NVMe SSD with Radxa OS Noble 24.04 (Ubuntu-based)
 
 ## Wake Word Training
 
@@ -268,19 +272,80 @@ Aim for 200+ positive clips and 50-100 negative clips from similar-sounding phra
 
 ### Ambient Noise Negatives
 
-The model also needs non-speech negatives (silence, fan noise, road noise) to avoid false triggers on ambient sounds:
+The model also needs non-speech negatives (silence, fan noise, road noise) to avoid false triggers on ambient sounds. There are two sources: synthetic/downloaded clips, and real recordings from a microphone.
+
+#### Synthetic + downloaded clips
 
 ```bash
 cd training/
 
 # Generate synthetic noise clips + download MS-SNSD (MIT) and MUSAN (CC0) recordings
 python3 generate_ambient_negatives.py
+```
 
-# Build the ambient feature file for training
+This populates `real_clips_negative/` with ambient noise clips across categories (fan noise, road noise, rain, HVAC, silence, etc.).
+
+#### Recording real ambient noise from a microphone
+
+For best results, also capture real ambient audio from the environment where the device will be used (vehicle interior, campsite, etc.). The `record_ambient_negatives.py` script records 2-second clips in a continuous loop for a set duration.
+
+1. Find your microphone's ALSA device:
+   ```bash
+   arecord -l
+   ```
+   Look for your USB mic (e.g. `card 2: USB [Jabra SPEAK 410 USB], device 0` → `hw:2,0`).
+
+2. Run a recording session (from the `training/` directory):
+   ```bash
+   python3 record_ambient_negatives.py --device hw:2,0 --minutes 30
+   ```
+   This records ~720 clips over 30 minutes, saving them to `training/real_clips_negative/ambient_recorded/`. Clips that are too quiet are automatically discarded. Press Ctrl+C to stop early.
+
+   Additional options: `--pause 1.0` (gap between clips, default 0.5s), `--min-rms 100` (minimum loudness to keep, default 50).
+
+3. Run multiple sessions to capture different environments — clips are appended, never overwritten.
+
+#### Build the ambient feature file
+
+After adding clips from either source, rebuild the feature file used by training:
+
+```bash
 python3 build_ambient_features.py
 ```
 
-This populates `real_clips_negative/` with ambient noise clips across categories (fan noise, road noise, rain, HVAC, silence, etc.) and produces a `negative_features_ambient.npy` file used during training.
+This produces `negative_features_ambient.npy` used during training.
+
+### Retraining the Model
+
+After recording new clips and rebuilding features, retrain the wake word model.
+
+**1. Prepare (from the `training/` directory):**
+
+```bash
+cd openwakeword-trainer
+pkill -f ComfyUI
+source /home/dave/.oww-trainer-venv/bin/activate
+rm -f output/hey_peregrine.onnx output/hey_peregrine.onnx.data
+rm -f export/hey_peregrine.onnx export/hey_peregrine.onnx.data
+```
+
+- ComfyUI must be stopped — it holds ~4 GB of GPU VRAM and training will OOM.
+- Old model files must be deleted — the pipeline skips training if they exist.
+
+**2. Run training (~16 minutes on an NVIDIA GPU):**
+
+```bash
+python train_wakeword.py --config configs/hey_peregrine.yaml --from train
+```
+
+The `onnx_tf` error at the end is harmless — the ONNX model exports successfully, it just can't convert to TFLite (which isn't used).
+
+**3. After training completes, copy the model to the project `models/` directory:**
+
+```bash
+cp output/hey_peregrine.onnx ../../models/
+cp output/hey_peregrine.onnx.data ../../models/
+```
 
 ### Deploying a New Model
 
@@ -303,8 +368,8 @@ ssh root@<board-ip> "chown assistant:assistant /home/assistant/models/hey_peregr
 |---|---|
 | [openWakeWord](https://github.com/dscripka/openWakeWord) | Apache 2.0 |
 | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | MIT |
-| [Ollama](https://github.com/ollama/ollama) | MIT |
 | [Qwen 2.5 0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) | Apache 2.0 |
+| Qualcomm Genie (genie-t2t-run) | Qualcomm proprietary (bundled with NPU model) |
 | [Piper TTS](https://github.com/rhasspy/piper) | MIT |
 | [Piper voice: en_US-libritts_r-medium](https://huggingface.co/rhasspy/piper-voices) | CC-BY-4.0 |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT |

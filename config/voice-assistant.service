@@ -1,7 +1,7 @@
 [Unit]
 Description=Local Voice Assistant
-After=network.target sound.target ollama.service
-Wants=ollama.service
+After=network.target sound.target genie-server.service
+Wants=genie-server.service
 
 [Service]
 Type=simple
