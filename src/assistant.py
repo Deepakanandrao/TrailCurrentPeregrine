@@ -39,7 +39,8 @@ PIPER_MODEL = os.getenv("PIPER_MODEL",
 
 SAMPLE_RATE = 16000
 CHUNK = 1280  # 80ms at 16kHz
-WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.8"))
+WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.85"))
+WAKE_ACTIVATIONS = int(os.getenv("WAKE_ACTIVATIONS", "3"))  # consecutive frames above threshold
 SILENCE_THRESHOLD = int(os.getenv("SILENCE_THRESHOLD", "500"))
 SILENCE_DURATION = float(os.getenv("SILENCE_DURATION", "1.5"))
 MAX_RECORD_SECONDS = 15
@@ -70,7 +71,7 @@ BASE_SYSTEM_PROMPT = (
 print("=" * 50)
 print("Voice Assistant Starting")
 print("=" * 50)
-print(f"  Wake word:  {WAKE_MODEL}")
+print(f"  Wake word:  {WAKE_MODEL} (threshold={WAKE_THRESHOLD}, activations={WAKE_ACTIVATIONS})")
 print(f"  STT model:  {WHISPER_SIZE}")
 print(f"  LLM model:  {OLLAMA_MODEL}")
 print(f"  TTS model:  {os.path.basename(PIPER_MODEL)}")
@@ -389,6 +390,13 @@ def _rebuild_device_registry():
     _device_registry = merged
     _device_names_by_id = names
     _device_types_by_id = types
+    # Rebuild phonetic index if available (defined later in file; not
+    # available during initial cache load at module import time, but that's
+    # fine — it gets built on the first MQTT registry update).
+    try:
+        _rebuild_phonetic_index()
+    except NameError:
+        pass
     print(f"  Device registry updated: {len(merged)} devices")
     for key, info in merged.items():
         print(f"    [{info['id']}] {info['name']} ({info['type']})")
@@ -844,6 +852,169 @@ def _get_device_status_response(device_id, device_name):
     return f"The {device_name} is {state_word}."
 
 
+# --- Phonetic matching (handles STT mishearings for any device name) ---
+
+def _metaphone(word):
+    """Simple Metaphone phonetic hash for English words.
+
+    Groups similar-sounding words (e.g. 'furness'/'furnace', 'cabnet'/'cabinet')
+    so STT mishearings can be corrected against the device registry.
+    """
+    word = word.upper().strip()
+    if not word:
+        return ''
+    # Deduplicate adjacent letters
+    deduped = word[0]
+    for c in word[1:]:
+        if c != deduped[-1]:
+            deduped += c
+    word = deduped
+    # Drop initial silent letter pairs
+    if word[:2] in ('AE', 'GN', 'KN', 'PN', 'WR'):
+        word = word[1:]
+    result = []
+    i = 0
+    while i < len(word):
+        c = word[i]
+        if c in 'AEIOU':
+            if i == 0:
+                result.append(c)
+            i += 1
+            continue
+        if c == 'B':
+            if not (i == len(word) - 1 and i > 0 and word[i - 1] == 'M'):
+                result.append('B')
+        elif c == 'C':
+            result.append('S' if i + 1 < len(word) and word[i + 1] in 'EIY' else 'K')
+        elif c == 'D':
+            result.append('J' if i + 1 < len(word) and word[i + 1] in 'GEI' else 'T')
+        elif c == 'F':
+            result.append('F')
+        elif c == 'G':
+            if i + 1 < len(word) and word[i + 1] in 'EIY':
+                result.append('J')
+            elif not (i > 0 and word[i - 1] in 'AEIOU'
+                      and (i + 1 >= len(word) or word[i + 1] not in 'AEIOU')):
+                result.append('K')
+        elif c == 'H':
+            if not (i > 0 and word[i - 1] in 'AEIOU'
+                    and (i + 1 >= len(word) or word[i + 1] in 'AEIOU')):
+                if i + 1 < len(word) and word[i + 1] in 'AEIOU':
+                    result.append('H')
+        elif c == 'J':
+            result.append('J')
+        elif c == 'K':
+            if not (i > 0 and word[i - 1] == 'C'):
+                result.append('K')
+        elif c == 'L':
+            result.append('L')
+        elif c == 'M':
+            result.append('M')
+        elif c == 'N':
+            result.append('N')
+        elif c == 'P':
+            if i + 1 < len(word) and word[i + 1] == 'H':
+                result.append('F')
+                i += 1
+            else:
+                result.append('P')
+        elif c == 'Q':
+            result.append('K')
+        elif c == 'R':
+            result.append('R')
+        elif c == 'S':
+            if i + 1 < len(word) and word[i + 1] == 'H':
+                result.append('X')
+                i += 1
+            elif i + 2 < len(word) and word[i:i + 3] in ('SIO', 'SIA'):
+                result.append('X')
+                i += 2
+            else:
+                result.append('S')
+        elif c == 'T':
+            if i + 1 < len(word) and word[i + 1] == 'H':
+                result.append('0')
+                i += 1
+            elif i + 2 < len(word) and word[i:i + 3] in ('TIA', 'TIO'):
+                result.append('X')
+                i += 2
+            else:
+                result.append('T')
+        elif c == 'V':
+            result.append('F')
+        elif c == 'W':
+            if i + 1 < len(word) and word[i + 1] in 'AEIOU':
+                result.append('W')
+        elif c == 'X':
+            result.append('K')
+            result.append('S')
+        elif c == 'Y':
+            if i + 1 < len(word) and word[i + 1] in 'AEIOU':
+                result.append('Y')
+        elif c == 'Z':
+            result.append('S')
+        i += 1
+    return ''.join(result)
+
+
+# Words to skip during phonetic substitution (grammar, not device names)
+_PHONETIC_SKIP = frozenset({
+    'the', 'a', 'an', 'on', 'off', 'turn', 'switch', 'set', 'my', 'all',
+    'and', 'to', 'its', 'at', 'in', 'is', 'are', 'put', 'of', 'how',
+    'what', 'which', 'where', 'much', 'many', 'check', 'status', 'get',
+    'tell', 'me', 'please', 'can', 'you', 'i', 'do', 'does', 'did',
+    'not', 'no', 'yes', 'up', 'down', 'enable', 'disable', 'activate',
+    'deactivate', 'start', 'stop', 'kill', 'shut', 'dim', 'adjust',
+    'change', 'brightness', 'percent', 'everything',
+})
+
+# Cached phonetic index of device-registry words (rebuilt when registry changes)
+_device_word_phonetics = {}  # metaphone_code -> set of original words
+_device_words = set()
+
+
+def _rebuild_phonetic_index():
+    """Rebuild the phonetic lookup table from current device names."""
+    _device_word_phonetics.clear()
+    _device_words.clear()
+    for name in _device_names_by_id.values():
+        for w in name.lower().split():
+            _device_words.add(w)
+            code = _metaphone(w)
+            if code not in _device_word_phonetics:
+                _device_word_phonetics[code] = set()
+            _device_word_phonetics[code].add(w)
+
+
+def _phonetic_substitute(text_lower):
+    """Replace unrecognized words with phonetically matching device-registry words.
+
+    Returns (substituted_text, changed_flag).  Only replaces words that are
+    not in the skip list, not already a known device word, and have an exact
+    metaphone match to a device word (with difflib as tiebreaker when multiple
+    candidates share a code).
+    """
+    if not _device_word_phonetics:
+        return text_lower, False
+    words = text_lower.split()
+    changed = False
+    result = []
+    for w in words:
+        if w in _PHONETIC_SKIP or w in _device_words:
+            result.append(w)
+            continue
+        code = _metaphone(w)
+        candidates = _device_word_phonetics.get(code)
+        if candidates and w not in candidates:
+            best = max(candidates,
+                       key=lambda c: difflib.SequenceMatcher(None, w, c).ratio())
+            result.append(best)
+            changed = True
+        else:
+            result.append(w)
+    return ' '.join(result), changed
+
+
 # --- Device resolution (named devices from MQTT config) ---
 
 _FUZZY_THRESHOLD = 0.85
@@ -853,7 +1024,8 @@ def _resolve_device(text):
     """Try to resolve a device name from spoken text.
 
     Returns (device_id, device_type, device_name) or None.
-    Uses exact substring match first, then fuzzy n-gram matching.
+    Uses exact substring match first, then phonetic word substitution,
+    then fuzzy n-gram matching.
     """
     if not _device_registry:
         return None
@@ -871,7 +1043,17 @@ def _resolve_device(text):
     if re.search(r"\b(?:everything|(?:(?:all|which|the|my)\s+(?:the\s+)?(?:lights?|lamps?|devices?)))\b", text, re.I):
         return None
 
-    # Pass 2: fuzzy n-gram match
+    # Pass 2: phonetic word substitution — replace misheard words with
+    # phonetically matching device words, then retry exact match
+    phonetic_text, was_substituted = _phonetic_substitute(text_lower)
+    if was_substituted:
+        print(f"  Phonetic correction: \"{text_lower}\" -> \"{phonetic_text}\"")
+        for key in sorted(_device_registry.keys(), key=len, reverse=True):
+            if key in phonetic_text:
+                info = _device_registry[key]
+                return (info["id"], info["type"], info["name"])
+
+    # Pass 3: fuzzy n-gram match (on original text)
     words = text_lower.split()
     best_score = 0.0
     best_match = None
@@ -981,6 +1163,13 @@ _STT_NORMALIZATIONS = [
     (re.compile(r"\beighty\s+percent\b", re.I), "80 percent"),
     (re.compile(r"\bninety\s+percent\b", re.I), "90 percent"),
     (re.compile(r"\bhundred\s+percent\b", re.I), "100 percent"),
+    # Spoken brightness levels without "percent" — normalize to N percent
+    (re.compile(r"\b(?:to\s+|at\s+)?half(?:\s+brightness)?\b", re.I), "to 50 percent"),
+    (re.compile(r"\b(?:to\s+|at\s+)?quarter(?:\s+brightness)?\b", re.I), "to 25 percent"),
+    (re.compile(r"\b(?:to\s+|at\s+)?full(?:\s+brightness)?\b", re.I), "to 100 percent"),
+    (re.compile(r"\b(?:to\s+|at\s+)?max(?:\s+brightness)?\b", re.I), "to 100 percent"),
+    (re.compile(r"\b(?:to\s+|at\s+)?minimum(?:\s+brightness)?\b", re.I), "to 10 percent"),
+    (re.compile(r"\b(?:to\s+|at\s+)?(?:three[\s-]*quarters?)(?:\s+brightness)?\b", re.I), "to 75 percent"),
     # "brightness" mishearings
     (re.compile(r"\bbright?nes\b", re.I), "brightness"),
     # Trailing punctuation cleanup (Whisper adds periods, commas)
@@ -1678,11 +1867,16 @@ def listen_for_wake_word(ignore_seconds=0):
 
     ignore_seconds: feed audio to the model but ignore detections for this
     many seconds (used to avoid speaker feedback re-triggering).
+
+    Requires WAKE_ACTIVATIONS consecutive frames above WAKE_THRESHOLD
+    before triggering, to reduce false positives from transient spikes.
     """
     proc = _ensure_arecord()
-    print(f"Listening for '{WAKE_MODEL}'...")
+    print(f"Listening for '{WAKE_MODEL}' (threshold={WAKE_THRESHOLD}, "
+          f"activations={WAKE_ACTIVATIONS})...")
     ignore_chunks = int(ignore_seconds * SAMPLE_RATE / CHUNK)
     chunk_count = 0
+    consecutive = 0
     chunk_bytes = CHUNK * 2  # 16-bit = 2 bytes per sample
     while True:
         data = proc.stdout.read(chunk_bytes)
@@ -1692,17 +1886,29 @@ def listen_for_wake_word(ignore_seconds=0):
             _kill_arecord()
             time.sleep(0.5)
             proc = _ensure_arecord()
+            consecutive = 0
             continue
         samples = np.frombuffer(data, dtype=np.int16)
         result = wake_model.predict(samples)
         chunk_count += 1
         if chunk_count <= ignore_chunks:
             continue
+        triggered = False
         for name, score in result.items():
             if WAKE_MODEL in name and score > WAKE_THRESHOLD:
-                print(f"  Wake word detected! ({name}: {score:.2f})")
-                wake_model.reset()
-                return
+                triggered = True
+                consecutive += 1
+                if consecutive >= WAKE_ACTIVATIONS:
+                    print(f"  Wake word detected! ({name}: {score:.2f}, "
+                          f"{consecutive} consecutive activations)")
+                    wake_model.reset()
+                    return
+                break
+        if not triggered:
+            if consecutive > 0:
+                # Reset streak — log it so we can see near-misses
+                print(f"  Wake score dropped after {consecutive} activation(s), resetting")
+            consecutive = 0
 
 
 def _drain_audio_buffer():
@@ -1768,6 +1974,19 @@ def record_speech():
     return b"".join(frames)
 
 
+def _build_whisper_prompt():
+    """Build an initial_prompt for Whisper from known device names.
+
+    Whisper uses initial_prompt as a conditioning hint — including the real
+    device names biases the model toward correct transcription of words like
+    'awning' that it might otherwise hallucinate as 'ottling'.
+    """
+    if not _device_names_by_id:
+        return None
+    names = sorted(set(_device_names_by_id.values()))
+    return "Device names: " + ", ".join(names) + "."
+
+
 def transcribe(pcm_bytes):
     """PCM bytes to text via faster-whisper."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
@@ -1776,7 +1995,11 @@ def transcribe(pcm_bytes):
             wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(pcm_bytes)
-        segments, _ = whisper_model.transcribe(f.name, beam_size=1)
+        kwargs = {"beam_size": 1}
+        prompt = _build_whisper_prompt()
+        if prompt:
+            kwargs["initial_prompt"] = prompt
+        segments, _ = whisper_model.transcribe(f.name, **kwargs)
         return " ".join(seg.text for seg in segments).strip()
 
 
