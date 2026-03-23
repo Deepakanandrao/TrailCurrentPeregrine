@@ -181,20 +181,26 @@ Log in at the GNOME desktop (or TTY if the desktop hasn't started yet).
 
 #### Resize the NVMe partition
 
-The flashed image has a small root partition. Expand it to use the full SSD:
+The flashed image has a small root partition. Expand it to use the full SSD.
+
+First, find which partition is mounted as root:
 
 ```bash
-# Check current size
 df -h /
-# Expected: ~5-6 GB used, small total
+# Note the partition (e.g. /dev/nvme0n1p3)
+```
 
-# Resize partition and filesystem to fill the NVMe
-sudo growpart /dev/nvme0n1 1
-sudo resize2fs /dev/nvme0n1p1
+The Radxa OS R2 image uses three partitions: `p1` (config), `p2` (EFI),
+`p3` (root). Resize the root partition:
+
+```bash
+# Resize partition 3 and its filesystem to fill the NVMe
+sudo growpart /dev/nvme0n1 3
+sudo resize2fs /dev/nvme0n1p3
 
 # Verify
 df -h /
-# Expected: total now matches your SSD size (e.g. 238G for a 256 GB drive)
+# Expected: total now matches your SSD size (e.g. 458G for a 512 GB drive)
 ```
 
 #### Generate SSH host keys and enable SSH

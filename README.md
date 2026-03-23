@@ -197,9 +197,11 @@ All settings are controlled via environment variables. On the board, site-specif
 |---|---|---|
 | `WAKE_MODEL` | `hey_peregrine` | openWakeWord model name |
 | `WAKE_MODEL_PATH` | *(auto-detected)* | Path to custom `.onnx` wake word model |
-| `WAKE_THRESHOLD` | `0.8` | Wake word detection threshold (0.0–1.0) |
+| `WAKE_THRESHOLD` | `0.85` | Wake word detection threshold (0.0–1.0) |
+| `WAKE_ACTIVATIONS` | `3` | Consecutive frames above threshold required to trigger |
 | `WHISPER_SIZE` | `base.en` | Whisper model size |
-| `LLM_URL` | `http://localhost:11434` | LLM API endpoint (Genie NPU server) |
+| `OLLAMA_URL` | `http://localhost:11434` | LLM API endpoint (Genie NPU server) |
+| `OLLAMA_MODEL` | `llama3.2:1b-npu` | Model identifier for LLM requests |
 | `PIPER_MODEL` | `~/piper-voices/en_US-libritts_r-medium.onnx` | Path to Piper voice model |
 | `SILENCE_THRESHOLD` | `500` | Amplitude below which audio is silence |
 | `SILENCE_DURATION` | `1.5` | Seconds of silence before stopping recording |
