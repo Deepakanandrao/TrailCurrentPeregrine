@@ -1,7 +1,15 @@
 # Radxa Dragon Q6A Board Setup
 
-Complete guide for flashing and provisioning the Radxa Dragon Q6A for the
-TrailCurrent Peregrine voice assistant. Follow every step in order.
+Complete guide for flashing the Radxa Dragon Q6A for the TrailCurrent
+Peregrine voice assistant. There are two methods:
+
+- **Method A (Recommended): Golden Image** — flash the pre-built custom image
+  that includes all software, models, and branding. Board is ready to use after
+  first boot. Use this for production boards.
+
+- **Method B: Manual Provisioning** — flash the stock Radxa OS image, then run
+  setup scripts to install everything. Use this if you need to modify the base
+  image or debug the setup process.
 
 ## Hardware
 
@@ -10,28 +18,196 @@ TrailCurrent Peregrine voice assistant. Follow every step in order.
 | **Board** | Radxa Dragon Q6A (Qualcomm QCS6490, 8 GB RAM) |
 | **SoC** | Qualcomm QCS6490 — ARM64, Hexagon DSP/NPU (12 TOPS) |
 | **Storage** | M.2 2230 NVMe SSD (installed in the M.2 M Key slot) |
-| **OS** | Radxa OS Noble (Ubuntu 24.04 based), R2 release |
+| **OS** | Custom Peregrine image (Ubuntu 24.04 based, from Radxa OS R2) |
 | **Audio** | USB microphone + speaker (ALSA, no PulseAudio) |
+| **Network** | Ethernet (LAN only — WiFi is disabled) |
 
 ## What You Need
 
 ### On the board
 - NVMe SSD installed in the M.2 M Key 2230 slot
 - 12 V USB-C power adapter (PD compatible)
+- Ethernet cable connected to your LAN
 
 ### On your Linux host (dev machine)
 - USB Type-A to Type-A cable (male-to-male)
 - USB 3.0 port
-- ~2 GB free disk space for downloads
+- The golden image (`peregrine-q6a-v1.0.img.xz`) or ~6 GB free disk space to
+  download the stock image
 
-## Part 1: Flash the Board
+---
+
+## Method A: Golden Image (Recommended)
+
+### A.1 Build the golden image (one-time)
+
+If someone has already built the image, skip to A.2. Otherwise, build it on
+your dev machine:
+
+```bash
+# Install prerequisites (one-time)
+sudo apt install qemu-user-static binfmt-support kpartx xz-utils
+
+# Build the image
+cd image_build
+sudo ./build-image.sh
+
+# Output: image_build/output/peregrine-q6a-v1.0.img.xz
+```
+
+The build takes 30-60 minutes (mostly downloading models). The resulting
+image includes all software, models, services, and branding.
+
+### A.2 Prepare flash tools
+
+```bash
+mkdir -p ~/dragon-flash && cd ~/dragon-flash
+
+# EDL flashing tool (Linux, no drivers needed)
+wget https://dl.radxa.com/q6a/images/edl-ng-dist.zip
+
+# SPI boot firmware (version 260120 — required for R1+ images)
+wget https://dl.radxa.com/dragon/q6a/images/dragon-q6a_flat_build_wp_260120.zip
+
+# Extract
+unzip -o edl-ng-dist.zip -d edl-ng-dist
+unzip -o edl-ng-dist/edl-ng-dist.zip -d edl-ng-dist
+chmod +x edl-ng-dist/linux-x64/edl-ng
+unzip -o dragon-q6a_flat_build_wp_260120.zip
+```
+
+### A.3 Decompress the golden image
+
+```bash
+cp /path/to/TrailCurrentPeregrine/image_build/output/peregrine-q6a-v1.0.img.xz ~/dragon-flash/
+cd ~/dragon-flash
+xz -dk peregrine-q6a-v1.0.img.xz
+```
+
+### A.4 Enter EDL mode
+
+1. **Disconnect power** (USB-C) from the board.
+2. **Connect the USB-A to USB-A cable** between the board's USB 3.1 OTG port
+   and your dev machine. Use the single USB-A port that supports USB 3.x
+   (typically blue inside), not one of the three USB 2.0 ports.
+3. **Press and hold the EDL button** (next to the audio jack).
+4. **While holding**, connect the 12 V USB-C power.
+5. **Release the EDL button** after ~1 second.
+
+Verify:
+
+```bash
+lsusb | grep 05c6:9008
+# Expected: Bus XXX Device XXX: ID 05c6:9008 Qualcomm, Inc. Gobi Wireless Modem (QDL mode)
+```
+
+### A.5 Flash SPI firmware (first time only)
+
+Skip this step if the board already has firmware version 260120 or newer.
+
+```bash
+cd ~/dragon-flash/flat_build/spinor/dragon-q6a/
+sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
+    --memory spinor \
+    --loader prog_firehose_ddr.elf \
+    rawprogram rawprogram0.xml patch0.xml
+```
+
+### A.6 Flash the golden image
+
+```bash
+cd ~/dragon-flash/flat_build/spinor/dragon-q6a/
+sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
+    --loader prog_firehose_ddr.elf \
+    --memory nvme \
+    write-sector 0 ~/dragon-flash/peregrine-q6a-v1.0.img
+```
+
+### A.7 Reset the board
+
+```bash
+sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
+    --loader prog_firehose_ddr.elf \
+    reset
+```
+
+Disconnect the USB-A cable.
+
+### A.8 First boot
+
+The board will boot into the golden image. On first boot, a one-time setup
+service automatically:
+
+1. Regenerates SSH host keys (unique per board)
+2. Regenerates the machine ID
+3. Expands the root partition to fill the NVMe
+4. Reboots
+
+**Wait ~90 seconds** for the first boot cycle to complete (two boots total).
+
+After the second boot, the board is ready. Connect via Ethernet:
+
+```bash
+ping peregrine.local        # Should respond (via Avahi/mDNS)
+ssh root@peregrine.local    # Should show the TrailCurrent mountain ASCII art
+```
+
+### A.9 Configure board-specific settings
+
+Run the configuration helper from your dev machine:
+
+```bash
+cd /path/to/TrailCurrentPeregrine/image_build
+./configure-board.sh peregrine.local
+```
+
+This prompts for:
+- MQTT broker address and credentials
+- TLS certificate (if using encrypted MQTT)
+- Optional static IP address
+
+### A.10 Verify
+
+```bash
+ssh root@peregrine.local
+
+# Check hostname
+hostname
+# Expected: peregrine
+
+# Check voice assistant
+systemctl status voice-assistant
+journalctl -u voice-assistant -n 20
+
+# Check NPU
+systemctl status genie-server
+```
+
+The voice assistant should be running and responding to "hey peregrine".
+
+### A.11 Push code updates (ongoing)
+
+To update the application code without re-flashing:
+
+```bash
+cd /path/to/TrailCurrentPeregrine
+./deploy.sh peregrine.local
+ssh root@peregrine.local "systemctl restart voice-assistant"
+```
+
+---
+
+## Method B: Manual Provisioning (Legacy)
+
+Use this method if you need to debug the setup process or cannot use the
+golden image.
 
 > **NVMe vs UFS:** This guide uses NVMe storage. If you are using UFS instead,
 > substitute `--memory UFS` for `--memory nvme` in the flash commands, and
 > download the `output_4096` image instead of `output_512`. Everything else is
 > the same.
 
-### 1.1 Download everything
+### B.1 Download everything
 
 Create a working directory and download the required files:
 
@@ -48,7 +224,7 @@ wget https://dl.radxa.com/dragon/q6a/images/dragon-q6a_flat_build_wp_260120.zip
 wget https://github.com/radxa-build/radxa-dragon-q6a/releases/download/rsdk-r2/radxa-dragon-q6a_noble_gnome_r2.output_512.img.xz
 ```
 
-### 1.2 Extract the downloads
+### B.2 Extract the downloads
 
 ```bash
 cd ~/dragon-flash
@@ -82,7 +258,7 @@ ls -lh radxa-dragon-q6a_noble_gnome_r2.output_512.img
 
 If any command returns "No such file or directory", re-check the extract steps above.
 
-### 1.3 Do you need to flash the SPI firmware?
+### B.3 Do you need to flash the SPI firmware?
 
 Radxa OS R2 requires SPI boot firmware version **260120** or newer.
 
@@ -95,7 +271,7 @@ Radxa OS R2 requires SPI boot firmware version **260120** or newer.
   If the output is `260120` or higher, **skip steps 1.4–1.5 and go directly
   to 1.6**. Otherwise, proceed with step 1.4.
 
-### 1.4 Enter EDL mode
+### B.4 Enter EDL mode
 
 The EDL (Emergency Download) button is located next to the audio jack on the
 board (position 14 on the Radxa board diagram).
@@ -125,7 +301,7 @@ Bus XXX Device XXX: ID 05c6:9008 Qualcomm, Inc. Gobi Wireless Modem (QDL mode)
 If `05c6:9008` does not appear, disconnect everything and repeat. The timing
 matters — hold the button **before** power, release **after**.
 
-### 1.5 Flash the SPI boot firmware
+### B.5 Flash the SPI boot firmware
 
 ```bash
 cd ~/dragon-flash/flat_build/spinor/dragon-q6a/
@@ -139,7 +315,7 @@ sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
 This takes about 2 minutes. Ignore any "missing fat12test.bin" warnings — they
 are harmless.
 
-### 1.6 Flash Radxa OS to NVMe
+### B.6 Flash Radxa OS to NVMe
 
 The board should still be in EDL mode after the SPI flash. If not, re-enter
 EDL mode (step 1.4).
@@ -156,7 +332,7 @@ sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
 This writes the full OS image to the NVMe. It takes a few minutes depending on
 the SSD speed.
 
-### 1.7 Reset the board
+### B.7 Reset the board
 
 ```bash
 sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
@@ -166,7 +342,7 @@ sudo ~/dragon-flash/edl-ng-dist/linux-x64/edl-ng \
 
 Disconnect the USB-A cable. The board will reboot into Radxa OS.
 
-### 1.8 First boot
+### B.8 First boot
 
 Connect a **display** (HDMI or USB-C DisplayPort), **keyboard**, and **mouse** to the
 board. The GNOME desktop image requires a display for initial setup. You will
@@ -250,7 +426,7 @@ ssh radxa@<board-ip>
 If this works, you can disconnect the display, keyboard, and mouse. All
 remaining steps are done over SSH.
 
-### 1.9 SSH in and set the root password
+### B.9 SSH in and set the root password
 
 ```bash
 ssh radxa@<board-ip>
@@ -278,7 +454,7 @@ ssh root@<board-ip> "hostname && cat /proc/device-tree/model"
 
 You should see `Radxa Dragon Q6A`.
 
-### 1.10 Verify the SPI firmware version
+### B.10 Verify the SPI firmware version
 
 ```bash
 ssh root@<board-ip> "dmidecode -s bios-version"
@@ -286,9 +462,9 @@ ssh root@<board-ip> "dmidecode -s bios-version"
 
 Should show `260120` or newer.
 
-## Part 2: Provision the Board
+### Part B.2: Provision the Board
 
-### 2.1 Copy the setup script to the board
+### B.11 Copy the setup script to the board
 
 From your dev machine, in the TrailCurrentPeregrine project root:
 
@@ -296,7 +472,7 @@ From your dev machine, in the TrailCurrentPeregrine project root:
 scp setup/setup-board.sh root@<board-ip>:/root/setup-board.sh
 ```
 
-### 2.2 Run the setup script
+### B.12 Run the setup script
 
 SSH into the board and run:
 
@@ -321,7 +497,7 @@ The script is **idempotent** — safe to re-run at any time. It performs:
 11. Sets CPU governor to performance
 12. Tunes kernel parameters (swappiness, dirty pages)
 
-### 2.3 Reboot
+### B.13 Reboot
 
 After setup completes, reboot to apply all changes:
 
@@ -332,7 +508,7 @@ reboot
 The board will boot to CLI (no desktop). The voice assistant service starts
 automatically.
 
-### 2.4 Deploy the application code
+### B.14 Deploy the application code
 
 From your dev machine:
 
@@ -346,19 +522,23 @@ Then restart the service:
 ssh root@<board-ip> "systemctl restart voice-assistant"
 ```
 
+---
+
 ## Part 3: Verify Everything Works
+
+These verification steps apply to both Method A and Method B.
 
 ### 3.1 Check the service
 
 ```bash
-ssh root@<board-ip> "systemctl status voice-assistant"
-ssh root@<board-ip> "journalctl -u voice-assistant -n 50"
+ssh root@peregrine.local "systemctl status voice-assistant"
+ssh root@peregrine.local "journalctl -u voice-assistant -n 50"
 ```
 
 ### 3.2 Test audio
 
 ```bash
-ssh root@<board-ip>
+ssh root@peregrine.local
 
 # List audio devices
 aplay -l
@@ -374,7 +554,7 @@ arecord -d 5 -f S16_LE -r 16000 /tmp/test.wav && aplay /tmp/test.wav
 ### 3.3 Test NPU inference
 
 ```bash
-ssh root@<board-ip>
+ssh root@peregrine.local
 
 cd /home/assistant/Llama3.2-1B-1024-v68
 export LD_LIBRARY_PATH=$(pwd)
@@ -387,7 +567,7 @@ Expected output: a coherent answer at ~12 tokens/second.
 ### 3.4 Test Piper TTS
 
 ```bash
-ssh root@<board-ip>
+ssh root@peregrine.local
 su - assistant
 
 echo 'Hello, I am your voice assistant.' | \
@@ -400,7 +580,7 @@ echo 'Hello, I am your voice assistant.' | \
 ### 3.5 Test genie server (NPU LLM over HTTP)
 
 ```bash
-ssh root@<board-ip> "curl -s http://localhost:11434/api/generate \
+ssh root@peregrine.local "curl -s http://localhost:11434/api/generate \
     -d '{\"prompt\":\"Say hello\",\"system\":\"Reply in one sentence.\"}' | python3 -m json.tool"
 ```
 

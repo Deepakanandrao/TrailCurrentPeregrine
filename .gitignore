@@ -67,6 +67,10 @@ training/.musan_cache/
 training/real_clips/
 training/real_clips_negative/
 
+# Image build artifacts (large — built from source)
+image_build/.cache/
+image_build/output/
+
 # Stray audio/recording files in repo root
 long_recording*
 karen_*
