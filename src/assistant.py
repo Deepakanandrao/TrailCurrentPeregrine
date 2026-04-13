@@ -498,6 +498,7 @@ def _connect_mqtt():
             client.subscribe("local/relays/+/status")
             client.subscribe("local/thermostat/status")
             client.subscribe("local/level/tilt")
+            client.subscribe("local/water/status")
             client.subscribe("local/config/pdm_channels")
             client.subscribe("local/config/relay_channels")
             # Request current config from Headwaters (in case retained topics are stale/absent)
@@ -659,6 +660,15 @@ def get_sensor_summary():
             lines.append(f"Tilt front-to-back: {fb:.1f}° ({abs(fb_in):.1f} inches {'low in front' if fb_in < 0 else 'low in back' if fb_in > 0 else 'level'})")
             lines.append(f"Tilt side-to-side: {ss:.1f}° ({abs(lr_in):.1f} inches {'low on left' if lr_in < 0 else 'low on right' if lr_in > 0 else 'level'})")
 
+    water = sensor_data.get("local/water/status")
+    if water:
+        if water.get("fresh") is not None:
+            lines.append(f"Fresh water tank: {water['fresh']:.0f}%")
+        if water.get("grey") is not None:
+            lines.append(f"Grey water tank: {water['grey']:.0f}%")
+        if water.get("black") is not None:
+            lines.append(f"Black water tank: {water['black']:.0f}%")
+
     if not lines:
         return "No sensor data available yet."
     return "Current sensor readings:\n" + "\n".join(lines)
@@ -707,56 +717,25 @@ def _build_can_message(can_id, data_bytes):
 def _execute_light_command(light_id, state):
     """Send a light command via MQTT. Returns spoken confirmation.
 
-    Handles both PDM lights (local/lights/{id}/command) and Switchback relays
-    typed as "light" (local/relays/{channel}/command).
+    All devices (PDM lights and Switchback relays) use local/lights/{id}/command.
+    Headwaters routes to the correct CAN address based on the device record in its DB.
     """
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
 
     state_word = "on" if state else "off"
+    payload = json.dumps({"state": state})
 
     if light_id == "all":
-        light_ids = [did for did, dtype in _device_types_by_id.items() if dtype == "light"]
-        if not light_ids:
-            return "I don't know which lights are available yet."
-        sent = 0
-        for lid in sorted(light_ids):
-            relay_ch = _relay_channel_by_id.get(lid)
-            if relay_ch is not None:
-                # Switchback relay typed as "light" — CAN toggles, check status
-                current = sensor_data.get(f"local/relays/{relay_ch}/status", {}).get("state")
-                if current is not None and current == state:
-                    name = _device_names_by_id.get(lid, f"relay {relay_ch}")
-                    print(f"  Skipping {name} (already {state_word} per MQTT status)")
-                    continue
-                topic = f"local/relays/{relay_ch}/command"
-                payload = json.dumps({"state": state})
-                mqtt.publish(topic, payload)
-                print(f"  MQTT publish: {topic} -> {payload}")
-            else:
-                # PDM light — CAN toggles, check status
-                current = sensor_data.get(f"local/lights/{lid}/status", {}).get("state")
-                if current is not None and current == state:
-                    name = _device_names_by_id.get(lid, f"light {lid}")
-                    print(f"  Skipping {name} (already {state_word} per MQTT status)")
-                    continue
-                topic = f"local/lights/{lid}/command"
-                payload = json.dumps({"state": state})
-                mqtt.publish(topic, payload)
-                print(f"  MQTT publish: {topic} -> {payload}")
-            sent += 1
-        if sent == 0:
-            return f"All lights are already {state_word}."
+        # Use the all-lights command topic — Headwaters sends explicit set-all CAN bytes
+        # to every PDM and Switchback instance, avoiding per-channel toggle side-effects.
+        topic = "local/lights/all/command"
+        mqtt.publish(topic, payload)
+        print(f"  MQTT publish: {topic} -> {payload}")
         return f"Turning {state_word} all lights."
     else:
         name = _device_names_by_id.get(int(light_id), f"light {light_id}")
-        # CAN commands are toggles — check MQTT status to avoid toggling wrong way
-        current = sensor_data.get(f"local/lights/{light_id}/status", {}).get("state")
-        if current is not None and current == state:
-            print(f"  Skipping {name} (already {state_word} per MQTT status)")
-            return f"{name} is already {state_word}."
         topic = f"local/lights/{light_id}/command"
-        payload = json.dumps({"state": state})
         mqtt.publish(topic, payload)
         print(f"  MQTT publish: {topic} -> {payload}")
         return f"Turning {state_word} {name}."
@@ -794,22 +773,13 @@ def _execute_brightness_command(light_id, percent):
 def _execute_device_command(device_id, device_name, device_type, state):
     """Send an on/off command for any device via MQTT.
 
-    Routes to relay topics for Switchback devices, light topics for PDM devices.
+    All devices use local/lights/{id}/command — Headwaters routes to CAN correctly
+    for both PDM lights and Switchback relays based on the device record in its DB.
     """
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
 
-    # Route relay devices through the relay MQTT topics
-    relay_ch = _relay_channel_by_id.get(int(device_id))
-    if relay_ch is not None or device_type == "relay":
-        return _execute_relay_command(device_id, device_name, state, relay_ch)
-
     state_word = "on" if state else "off"
-    # CAN commands are toggles — check MQTT status to avoid toggling wrong way
-    current = sensor_data.get(f"local/lights/{device_id}/status", {}).get("state")
-    if current is not None and current == state:
-        print(f"  Skipping {device_name} (already {state_word} per MQTT status)")
-        return f"The {device_name} is already {state_word}."
     topic = f"local/lights/{device_id}/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
@@ -818,30 +788,11 @@ def _execute_device_command(device_id, device_name, device_type, state):
 
 
 def _execute_relay_command(device_id, device_name, state, relay_channel=None):
-    """Send a relay on/off command via MQTT.
-
-    Individual relay commands are toggles on CAN — sending a command to a
-    relay that is already in the desired state will toggle it the wrong way.
-    We check the real MQTT status (published by the device) before sending.
-    If we have no status data we send anyway (better to try than ignore).
-    """
+    """Send a relay on/off command via MQTT using the unified light command topic."""
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
     state_word = "on" if state else "off"
-
-    if relay_channel is None:
-        relay_channel = _relay_channel_by_id.get(int(device_id))
-    if relay_channel is None:
-        return f"Sorry, I don't know the relay channel for {device_name}."
-
-    # Guard: skip if device already reports the desired state (avoid toggle)
-    status_topic = f"local/relays/{relay_channel}/status"
-    current = sensor_data.get(status_topic, {}).get("state")
-    if current is not None and current == state:
-        print(f"  Skipping {device_name} (already {state_word} per MQTT status)")
-        return f"The {device_name} is already {state_word}."
-
-    topic = f"local/relays/{relay_channel}/command"
+    topic = f"local/lights/{device_id}/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
     print(f"  MQTT publish: {topic} -> {payload}")
@@ -849,32 +800,19 @@ def _execute_relay_command(device_id, device_name, state, relay_channel=None):
 
 
 def _execute_relay_all_command(state):
-    """Send all-relays on/off command via MQTT.
-
-    Sends individual relay commands (not bulk) so we can check each relay's
-    current state and skip those already in the desired state (CAN toggles).
-    """
+    """Send all-relays on/off command via MQTT using the unified light command topic."""
     if not mqtt:
         return "Sorry, I'm not connected to the device system right now."
     state_word = "on" if state else "off"
 
-    if not _relay_channel_by_id:
+    if not _relay_entries:
         return "I don't know which relays are available yet."
 
-    sent = 0
-    for dev_id, relay_ch in _relay_channel_by_id.items():
-        current = sensor_data.get(f"local/relays/{relay_ch}/status", {}).get("state")
-        if current is not None and current == state:
-            name = _device_names_by_id.get(dev_id, f"relay {relay_ch}")
-            print(f"  Skipping {name} (already {state_word} per MQTT status)")
-            continue
-        topic = f"local/relays/{relay_ch}/command"
-        payload = json.dumps({"state": state})
-        mqtt.publish(topic, payload)
-        print(f"  MQTT publish: {topic} -> {payload}")
-        sent += 1
-    if sent == 0:
-        return f"All relays are already {state_word}."
+    # Use the all-relays command topic — Headwaters sends explicit set-all CAN bytes
+    # to every Switchback instance, avoiding per-channel toggle side-effects.
+    topic = "local/relays/all/command"
+    mqtt.publish(topic, payload)
+    print(f"  MQTT publish: {topic} -> {payload}")
     return f"Turning {state_word} all relays."
 
 
@@ -1360,6 +1298,13 @@ _SATELLITE_PATTERNS = [
     re.compile(r"\bhow\s+many\s+sat", re.I),
     re.compile(r"\bgps\s+(?:signal|fix|status|lock)\b", re.I),
 ]
+_WATER_PATTERNS = [
+    re.compile(r"\bwater\s*level", re.I),
+    re.compile(r"\bwater\s+(?:tank|supply|status)\b", re.I),
+    re.compile(r"\b(?:fresh|grey|gray|black)\s+(?:water|tank)\b", re.I),
+    re.compile(r"\bhow\s+much\b.*\bwater\b", re.I),
+    re.compile(r"\b(?:reservoir|water)\s+tank", re.I),
+]
 _LEVEL_PATTERNS = [
     re.compile(r"\blevel\b", re.I),
     re.compile(r"\btilt(?:ed|ing)?\b", re.I),
@@ -1511,6 +1456,36 @@ def match_intent(text):
     if text != original:
         print(f"  STT normalized: \"{original}\" -> \"{text}\"")
     is_question = bool(_IS_QUESTION.search(text))
+
+    # --- Water tank query (check before level/tilt so "water levels" doesn't hit tilt) ---
+    for pattern in _WATER_PATTERNS:
+        if pattern.search(text):
+            print("  Intent: water tank query")
+            water = sensor_data.get("local/water/status")
+            if not water:
+                return "I don't have water tank data right now."
+            fresh = water.get("fresh")
+            grey  = water.get("grey")
+            black = water.get("black")
+            # Specific tank queries
+            wants_fresh = bool(re.search(r"\bfresh\b", text, re.I))
+            wants_grey  = bool(re.search(r"\b(?:grey|gray)\b", text, re.I))
+            wants_black = bool(re.search(r"\bblack\b", text, re.I))
+            if wants_fresh and not wants_grey and not wants_black:
+                return f"The fresh water tank is at {fresh:.0f}%." if fresh is not None else "I don't have fresh water data right now."
+            if wants_grey and not wants_fresh and not wants_black:
+                return f"The grey water tank is at {grey:.0f}%." if grey is not None else "I don't have grey tank data right now."
+            if wants_black and not wants_fresh and not wants_grey:
+                return f"The black water tank is at {black:.0f}%." if black is not None else "I don't have black tank data right now."
+            # All tanks
+            parts = []
+            if fresh is not None:
+                parts.append(f"fresh water at {fresh:.0f}%")
+            if grey is not None:
+                parts.append(f"grey tank at {grey:.0f}%")
+            if black is not None:
+                parts.append(f"black tank at {black:.0f}%")
+            return ("Water tank levels: " + ", ".join(parts) + ".") if parts else "I don't have water tank data right now."
 
     # --- Level/tilt query (check before device resolution so "is the trailer level"
     #     doesn't get captured as a device status query for a device named "trailer") ---

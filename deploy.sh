@@ -53,6 +53,7 @@ trap cleanup EXIT
 
 SCP="scp -o ControlPath=$SOCK"
 SSH="ssh -o ControlPath=$SOCK"
+SSHT="ssh -t -o ControlPath=$SOCK"
 
 # ── 1. Refresh openwakeword (--no-deps; tflite-runtime has no aarch64 wheel) ─
 echo "[1/5] Refreshing openwakeword + timezonefinder..."
@@ -79,10 +80,10 @@ fi
 echo "[5/5] Copying service files..."
 $SCP "${SCRIPT_DIR}/config/voice-assistant.service" "${TARGET}:/tmp/voice-assistant.service"
 $SCP "${SCRIPT_DIR}/config/genie-server.service"   "${TARGET}:/tmp/genie-server.service"
-$SSH "$TARGET" "sudo install -m 644 /tmp/voice-assistant.service /etc/systemd/system/voice-assistant.service && \
-                sudo install -m 644 /tmp/genie-server.service   /etc/systemd/system/genie-server.service && \
-                rm -f /tmp/voice-assistant.service /tmp/genie-server.service && \
-                sudo systemctl daemon-reload"
+$SSHT "$TARGET" "sudo install -m 644 /tmp/voice-assistant.service /etc/systemd/system/voice-assistant.service && \
+                 sudo install -m 644 /tmp/genie-server.service   /etc/systemd/system/genie-server.service && \
+                 rm -f /tmp/voice-assistant.service /tmp/genie-server.service && \
+                 sudo systemctl daemon-reload"
 
 echo ""
 echo "Deploy complete. Files copied:"
@@ -93,8 +94,8 @@ echo "  /etc/systemd/system/voice-assistant.service"
 echo "  /etc/systemd/system/genie-server.service"
 echo ""
 echo "To restart the assistant:"
-echo "  ssh ${TARGET} sudo systemctl restart voice-assistant"
+echo "  ssh -t ${TARGET} sudo systemctl restart voice-assistant"
 echo ""
 echo "To watch logs:"
-echo "  ssh ${TARGET} sudo journalctl -u voice-assistant -f"
+echo "  ssh -t ${TARGET} sudo journalctl -u voice-assistant -f"
 echo ""

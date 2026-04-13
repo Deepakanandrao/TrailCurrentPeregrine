@@ -123,6 +123,9 @@ The first-login wizard offers MQTT setup. To change it later:
 ssh trailcurrent@peregrine.local
 nano ~/assistant.env
 sudo systemctl restart voice-assistant
+
+# Monitor live logs
+sudo journalctl -u voice-assistant -f
 ```
 
 Without MQTT configured, the assistant still answers general questions —
@@ -140,6 +143,7 @@ With MQTT connected, the assistant responds to:
 | **Named devices** | "Turn on the water pump", "Turn off the awning light" |
 | **Relay status** | "What relays are on?", "Switch status" |
 | **Everything** | "Turn off everything", "Turn on all the lights" |
+| **Water tanks** | "What are my water levels?", "How much fresh water do I have?", "How full is the grey tank?", "Black tank status" |
 | **Temperature** | "What's the temperature?", "How hot is it?" |
 | **Humidity** | "What's the humidity?" |
 | **Battery/energy** | "What's the battery level?", "How much solar?" |
@@ -186,6 +190,7 @@ The assistant subscribes to these topics for sensor data and device config:
 | `local/gps/latlon` | `{"latitude": float, "longitude": float}` |
 | `local/gps/time` | `{"year": int, "month": int, "day": int, "hour": int, "minute": int, "second": int}` (UTC) |
 | `local/gps/alt` | `{"altitudeInMeters": float, "altitudeFeet": int}` |
+| `local/water/status` | `{"fresh": %, "grey": %, "black": %}` (0–100 percent) |
 | `local/lights/+/status` | `{"state": 0/1, "name": "..."}` (Torrent lights) |
 | `local/relays/+/status` | `{"state": 0/1}` (Switchback relays) |
 | `local/thermostat/status` | Thermostat state |

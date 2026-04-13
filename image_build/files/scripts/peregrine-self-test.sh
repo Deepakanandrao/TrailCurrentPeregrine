@@ -32,6 +32,14 @@ echo ""
 echo -e "${BOLD}${GREEN}Trail${TEAL}Current${RESET} ${BOLD}Peregrine — Hardware Self-Test${RESET}"
 echo ""
 
+# ── Stop voice assistant for audio tests (holds the Jabra device open) ───────
+VA_WAS_RUNNING=false
+if systemctl is-active --quiet voice-assistant 2>/dev/null; then
+    VA_WAS_RUNNING=true
+    sudo systemctl stop voice-assistant 2>/dev/null || true
+    sleep 1
+fi
+
 # ── 1. ALSA capture device ──────────────────────────────────────────────────
 section "1. ALSA capture device"
 if arecord -l 2>/dev/null | grep -q "card "; then
@@ -52,11 +60,21 @@ fi
 
 # ── 3. Speaker test ─────────────────────────────────────────────────────────
 section "3. Speaker (1-second tone)"
-if timeout 5 speaker-test -t sine -f 440 -l 1 -s 1 -p 100 >/dev/null 2>&1; then
-    ok "Speaker emitted tone"
+# Use aplay with a raw sine wave — speaker-test can hang waiting for period completion.
+# Generate 1s of 440Hz sine at 16kHz mono 16-bit LE and play it.
+TMP_TONE=$(mktemp --suffix=.wav)
+python3 -c "
+import wave, struct, math
+with wave.open('${TMP_TONE}', 'wb') as f:
+    f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
+    f.writeframes(b''.join(struct.pack('<h', int(32767*math.sin(2*math.pi*440*i/16000))) for i in range(16000)))
+" 2>/dev/null
+if timeout 4 aplay -q "$TMP_TONE" 2>/dev/null; then
+    ok "Speaker played 1-second tone"
 else
-    warn "speaker-test failed (non-fatal — Jabra may already be in use)"
+    err "Speaker test failed — is the Jabra Speak connected?"
 fi
+rm -f "$TMP_TONE"
 
 # ── 4. Microphone capture (3 sec, RMS check) ────────────────────────────────
 section "4. Microphone (3-second capture, RMS check)"
@@ -81,6 +99,11 @@ else
     err "arecord failed"
 fi
 rm -f "$TMP_WAV"
+
+# ── Restart voice assistant now that audio tests are done ───────────────────
+if $VA_WAS_RUNNING; then
+    sudo systemctl start voice-assistant 2>/dev/null || true
+fi
 
 # ── 5. CDSP remoteproc state ────────────────────────────────────────────────
 section "5. NPU CDSP remoteproc"

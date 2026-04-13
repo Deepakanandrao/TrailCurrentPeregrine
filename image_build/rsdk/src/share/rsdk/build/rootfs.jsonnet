@@ -439,6 +439,8 @@ function(
                 STAGING="${PEREGRINE_STAGING:-/tmp/peregrine-staging}"
                 install -m 644 "$STAGING/files/profile/trailcurrent-prompt.sh" \
                     "$1/etc/profile.d/trailcurrent-prompt.sh"
+                install -m 644 "$STAGING/files/profile/first-login-hook.bash" \
+                    "$1/etc/profile.d/first-login-hook.sh"
             |||,
 
             // ════════════════════════════════════════════════════════════════
@@ -515,15 +517,14 @@ function(
             |||,
 
             // ════════════════════════════════════════════════════════════════
-            // Hook 24: Note first-login wizard location (opt-in, not auto-run)
-            // The wizard is installed at /usr/local/bin/peregrine-first-login.sh
-            // Run manually to configure MQTT, static IP, and self-test.
-            // Auto-launch removed — default password trailcurrent/trailcurrent
-            // must work on first SSH without any forced interaction.
+            // Hook 24: First-login wizard auto-runs on first interactive SSH session
+            // Installed via /etc/profile.d/first-login-hook.sh (hook 18).
+            // Guards: interactive terminal check ([ -t 0 ]) and
+            // ~/.peregrine-setup-complete sentinel — runs exactly once.
             // ════════════════════════════════════════════════════════════════
             |||
                 set -e
-                echo "[hook 24] wizard available at /usr/local/bin/peregrine-first-login.sh (opt-in)"
+                echo "[hook 24] first-login wizard installed via /etc/profile.d/first-login-hook.sh"
             |||,
 
             // ════════════════════════════════════════════════════════════════
@@ -696,6 +697,7 @@ function(
                 check_x "$1" /usr/local/bin/peregrine-self-test.sh
                 check "$1" /usr/share/plymouth/themes/trailcurrent/trailcurrent.plymouth
                 check "$1" /etc/peregrine-release
+                check "$1" /etc/profile.d/first-login-hook.sh
                 check "$1" /etc/modprobe.d/disable-wifi.conf
                 check "$1" /etc/sysctl.d/90-peregrine.conf
                 check "$1" /etc/asound.conf
