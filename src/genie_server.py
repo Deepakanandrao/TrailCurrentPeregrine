@@ -419,15 +419,91 @@ def _run_genie_stream_subprocess(prompt: str, num_predict: int = 200):
 
 
 # ============================================================================
+# Sentence-level dedup — cuts off exact-phrase repetition loops
+# ============================================================================
+#
+# Llama 3.2 1B on this sampler config (top-p 0.95, temp 0.8, no repetition
+# penalty available in Genie's schema-v1 sampler) reliably falls into
+# paragraph-level loops on open-ended prose ("tell me facts about Jackson").
+# Once it emits a phrase, the same phrase is often the highest-probability
+# continuation a few sentences later, and the model happily restates the
+# whole paragraph. Users see this as the same 3-sentence blurb copy-pasted
+# 3-4 times until the token budget runs out.
+#
+# The dedup filter buffers text until it sees a sentence boundary, normalizes
+# each completed sentence, and silently drops any whose normalized form
+# matches one already emitted this response. JSON control commands
+# ({"action":...}) have no sentence boundaries so they flow through
+# untouched into the final flush — no risk of eating a legitimate device
+# command.
+
+import re as _re
+_SENT_BOUNDARY = _re.compile(r"([.!?])(\s+|$)")
+
+
+def _normalize_sentence(s: str) -> str:
+    """Lowercase, strip punctuation + collapse whitespace for dedup comparison."""
+    s = _re.sub(r"[^\w\s]", "", s).lower()
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _dedup_sentences(source):
+    """Wrap a (text, is_done) generator, dropping repeated sentences.
+
+    The (text, is_done) contract is preserved: a single done=True is always
+    yielded last, and every yielded text is a slice of the original stream —
+    just possibly shorter, with duplicate sentences excised.
+    """
+    seen = set()
+    buf = ""
+    for text, done in source:
+        if text:
+            buf += text
+        # Emit complete sentences one at a time until no more boundaries
+        # remain in the buffer.
+        while True:
+            m = _SENT_BOUNDARY.search(buf)
+            if not m:
+                break
+            end = m.end()
+            sentence = buf[:end]
+            buf = buf[end:]
+            norm = _normalize_sentence(sentence)
+            # Very-short "sentences" (single-word interjections, numbers) get
+            # a pass — the dedup window shouldn't reject legitimate short
+            # answers like "Yes." or "OK." if they naturally appear twice.
+            if len(norm) < 12 or norm not in seen:
+                if len(norm) >= 12:
+                    seen.add(norm)
+                yield (sentence, False)
+        if done:
+            # Flush any trailing partial sentence (last chunk without a
+            # boundary — common for JSON output or short answers).
+            if buf:
+                norm = _normalize_sentence(buf)
+                if len(norm) < 12 or norm not in seen:
+                    yield (buf, False)
+                buf = ""
+            yield ("", True)
+            return
+
+
+# ============================================================================
 # Unified entry points — pick persistent or subprocess at runtime
 # ============================================================================
 
 def run_genie_stream(prompt: str, num_predict: int = 200):
-    """Yield (text_chunk, is_done) tuples. Uses persistent NPU when available."""
+    """Yield (text_chunk, is_done) tuples. Uses persistent NPU when available.
+
+    All streams pass through _dedup_sentences to break repetition loops
+    that Genie's current sampler config can't avoid on its own.
+    """
     if _genie_lib is not None:
-        yield from _genie_lib.stream(prompt)
+        source = _genie_lib.stream(prompt)
     else:
-        yield from _run_genie_stream_subprocess(prompt, num_predict)
+        source = _run_genie_stream_subprocess(prompt, num_predict)
+    yield from _dedup_sentences(source)
 
 
 def run_genie(prompt: str, num_predict: int = 200) -> tuple[str, float]:

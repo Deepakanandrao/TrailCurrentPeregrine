@@ -854,10 +854,66 @@ def get_sensor_summary():
 _SYSTEM_PROMPT_BUDGET_CHARS = 2200
 _last_system_prompt_size = None
 
+# Lean prose prompt — used when the query clearly isn't a device command.
+# Skipping the 1900-char device-control JSON schema in BASE_SYSTEM_PROMPT
+# frees ~500 tokens of context for the model's actual reasoning. Small
+# models with a 1024-token window regularly run out of room mid-answer and
+# start looping — this cuts that failure mode significantly. The explicit
+# "answer once, don't restate" line is belt-and-braces along with the
+# sentence-level dedup in genie_server.py.
+_LEAN_PROSE_PROMPT = (
+    "You are Peregrine, a voice and chat assistant for the TrailCurrent "
+    "vehicle platform. Answer the user's question directly in 1 to 3 short "
+    "sentences. Do not use markdown, bullet points, or headings. Answer "
+    "once — do not restate or paraphrase yourself. If you don't know, say "
+    "so briefly.\n\n"
+)
 
-def get_system_prompt():
-    """Build the full system prompt with current sensor data and device registry.
+# Verbs / imperatives that indicate the user is issuing a device-control
+# command, which means the LLM needs the full JSON-schema prompt to emit a
+# structured action. Prose queries ("tell me about", "what is", "how does")
+# don't hit these and get the lean prompt instead.
+_COMMAND_INTENT_PATTERNS = [
+    # Verbs that need a modifier (turn/switch/set/toggle can be used in prose:
+    # "set the record straight", "turn the page" — require an on/off/to/etc.
+    # to be confident it's a device command).
+    re.compile(
+        r"\b(?:turn|switch|toggle|set|make|change)\b"
+        r".*\b(?:on|off|to|up|down|brighter|dimmer|louder|quieter)\b",
+        re.I,
+    ),
+    # Verbs that are unambiguously command-shape on their own in this domain
+    # ("dim the bedroom", "brighten the porch", "play music", "mute the radio").
+    re.compile(r"\b(?:dim|brighten|tune|play|pause|stop|resume|mute|unmute)\b", re.I),
+    re.compile(r"\b(?:volume|brightness)\b", re.I),
+    re.compile(r"\b(?:all\s+(?:lights?|relays?|devices?)|everything)\b", re.I),
+]
 
+
+def _looks_like_command(text):
+    """True when the text has command-shape (imperative verb + target).
+
+    Prose queries ("tell me about X", "what is Y", "how does Z work") return
+    False and get the lean system prompt. Device-control queries get the
+    full JSON-schema prompt so the model can emit a structured action.
+    """
+    if not text:
+        return False
+    for pattern in _COMMAND_INTENT_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def get_system_prompt(user_prompt=None):
+    """Build the system prompt for the LLM.
+
+    When ``user_prompt`` is provided and doesn't look like a device command,
+    returns a lean prose-focused prompt (identity + short-answer directive +
+    sensor summary). This gives the model ~500 more tokens of context to
+    actually reason with, which materially improves quality on the 1B model.
+
+    Otherwise returns the full command-schema prompt with device registry.
     Capped to ``_SYSTEM_PROMPT_BUDGET_CHARS`` total. Dynamic sections (sensor
     summary, device registry, playbills) are appended only while there is
     remaining budget; the device / playbill lists are truncated to fit rather
@@ -872,6 +928,20 @@ def get_system_prompt():
             "ideally under 3 sentences. Do not use markdown, bullet points, or formatting "
             "since your response will be spoken aloud."
         )
+
+    # Lean path — prose queries skip the ~1900-char JSON schema entirely.
+    if user_prompt is not None and not _looks_like_command(user_prompt):
+        parts = [_LEAN_PROSE_PROMPT]
+        remaining = _SYSTEM_PROMPT_BUDGET_CHARS - len(_LEAN_PROSE_PROMPT)
+        summary = get_sensor_summary()
+        if summary and len(summary) <= remaining:
+            parts.append(summary)
+        prompt = "".join(parts)
+        if _last_system_prompt_size is None or len(prompt) > _last_system_prompt_size:
+            print(f"  System prompt (lean): {len(prompt)} chars "
+                  f"(~{len(prompt)//4} tokens)")
+            _last_system_prompt_size = len(prompt)
+        return prompt
 
     parts = [BASE_SYSTEM_PROMPT]
     remaining = _SYSTEM_PROMPT_BUDGET_CHARS - len(BASE_SYSTEM_PROMPT)
@@ -2348,7 +2418,12 @@ _BATTERY_PATTERNS = [
 # location patterns — otherwise "what cities are nearby" matches "where are we"
 # via the second _LOCATION_PATTERNS entry and never reaches the nearby handler.
 _NEARBY_CITIES_PATTERNS = [
-    re.compile(r"\b(?:cities|towns?|places?)\s+(?:are\s+)?(?:near|nearby|around)\b", re.I),
+    # Require an interrogative/quantifier prefix ("what/which/any") to avoid
+    # matching the idiomatic phrase "took place around here" — otherwise a
+    # question like "what historical events took place around here" would
+    # get answered with a list of nearby cities instead of falling through
+    # to the LLM enrichment path.
+    re.compile(r"\b(?:what|which|any)\s+(?:cities|towns?|places?)\s+(?:are\s+)?(?:near|nearby|around)\b", re.I),
     re.compile(r"\bnearby\s+(?:cities|towns?|places?)\b", re.I),
     re.compile(r"\bwhat(?:'s|s|\s+is)?\s+(?:close|nearby)\b", re.I),
     re.compile(r"\bwhat\s+towns?\s+are\s+(?:close|near)\b", re.I),
@@ -2366,6 +2441,20 @@ _LOCATION_PATTERNS = [
     re.compile(r"\b(?:location|where\s+(?:am\s+i|are\s+we)|gps|coordinates?)\b", re.I),
     re.compile(r"\bwhere\s+(?:am\s+i|are\s+we|is\s+(?:the|this))\b", re.I),
     re.compile(r"\bwhat\s+(?:city|town)\s+(?:am\s+i|are\s+we)\s+in\b", re.I),
+]
+# Phrases that reference the user's *current* location without directly asking
+# for it. Any question with one of these needs the LLM to know "here" = "Jackson,
+# Wyoming" before it responds, or the model will either refuse ("I don't know
+# your location") or hallucinate a random place. Bare "here" is intentionally
+# NOT a pattern — too common in unrelated contexts ("come here", "over here").
+_LOCATION_CONTEXT_PATTERNS = [
+    re.compile(r"\bwhere\s+(?:i\s+am|we\s+are|i(?:'m|\s+at)|we(?:'re|\s+at))\b", re.I),
+    re.compile(r"\bthis\s+(?:area|place|town|city|region|state|county|country|park|campground|neighborhood|spot|location)\b", re.I),
+    re.compile(r"\baround\s+(?:here|me|us)\b", re.I),
+    re.compile(r"\b(?:my|our)\s+(?:current\s+)?(?:location|area|region|surroundings|whereabouts)\b", re.I),
+    re.compile(r"\bin\s+(?:this|the)\s+area\b", re.I),
+    re.compile(r"\bthe\s+local\b", re.I),
+    re.compile(r"\bnear\s+(?:me|us|here)\b", re.I),
 ]
 _TIME_PATTERNS = [
     re.compile(r"\bwhat\s+time\b", re.I),
@@ -2683,6 +2772,56 @@ def _reverse_geocode(lat, lon):
         })
         return body
     return None
+
+
+def _format_place(place):
+    """Render a reverse-geocode result as a natural place name.
+
+    Same logic the location intent uses ("Austin, Texas" / "Toronto, Ontario,
+    Canada"). Extracted so the enrichment helper below can share it.
+    """
+    if not place or not place.get("place"):
+        return ""
+    city = place["place"]
+    region = (place.get("region") or "").strip()
+    country = (place.get("country") or "").strip()
+    cc = (place.get("cc") or "").strip()
+    if cc == "US" and region:
+        return f"{city}, {region}"
+    if region and country and country != region:
+        return f"{city}, {region}, {country}"
+    if region:
+        return f"{city}, {region}"
+    if country:
+        return f"{city}, {country}"
+    return city
+
+
+def _enrich_with_location_context(text):
+    """Prepend a location-fact statement when the user's message references
+    "here", "this area", "where I am", etc. Returns the text unchanged if
+    no reference is detected or if we don't have a usable GPS fix.
+
+    The point is to keep the small on-device LLM from either refusing
+    ("I don't know your location") or hallucinating a random city when
+    asked about "the local wildlife" or "restaurants around here".
+    """
+    for pattern in _LOCATION_CONTEXT_PATTERNS:
+        if pattern.search(text):
+            break
+    else:
+        return text
+    fix = _current_gps_fix()
+    if not fix:
+        return text
+    place = _reverse_geocode(*fix)
+    loc = _format_place(place)
+    if not loc:
+        return text
+    # Assertive fact statement in parentheses — small models get confused by
+    # hedging. Preserve the user's original question verbatim so the model
+    # doesn't answer a paraphrase.
+    return f"(Context: the user is currently in {loc}.) {text}"
 
 
 def _nearby_cities(lat, lon, limit=5, radius_km=100):
@@ -3348,6 +3487,21 @@ def _start_intent_rpc():
                     "confirmation": confirmation,
                 })
                 return
+            if self.path == "/api/enrich":
+                # Second-chance path for the chat: if /api/intent didn't
+                # match, ask whether we should rewrite the user's message
+                # with an assertive "you are currently in <city>" prefix
+                # before it reaches the LLM.
+                try:
+                    enriched = _enrich_with_location_context(text)
+                except Exception as e:
+                    print(f"[intent-rpc] enrich error: {e}")
+                    enriched = text
+                self._send_json({
+                    "text": enriched,
+                    "changed": enriched != text,
+                })
+                return
             self._send_json({"error": "not found"}, status=404)
 
         def do_GET(self):
@@ -3707,7 +3861,7 @@ def ask_llm(prompt):
         resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
-            "system": get_system_prompt(),
+            "system": get_system_prompt(prompt),
             "stream": False,
             "keep_alive": "30m",
             "options": {
@@ -3746,7 +3900,7 @@ def ask_llm_stream(prompt):
         resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
-            "system": get_system_prompt(),
+            "system": get_system_prompt(prompt),
             "stream": True,
             "keep_alive": "30m",
             "options": {
@@ -4044,8 +4198,15 @@ while True:
             # Fall back to LLM for general questions — stream sentences to TTS
             # so playback starts as soon as the first sentence is generated,
             # rather than waiting for the full reply.
+            #
+            # If the question references "here" / "this area" / "the local X",
+            # rewrite the prompt with an assertive location fact so the small
+            # 1B model doesn't refuse or hallucinate a random place.
+            llm_prompt = _enrich_with_location_context(user_text)
+            if llm_prompt != user_text:
+                print(f"  Enriched with location context")
             print("  Asking LLM...")
-            chunks_iter = ask_llm_stream(user_text)
+            chunks_iter = ask_llm_stream(llm_prompt)
             first = next(chunks_iter, None)
             if first is None:
                 speak("Sorry, I didn't get a response.")

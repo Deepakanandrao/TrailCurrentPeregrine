@@ -106,6 +106,20 @@ def _latest_user_text(messages):
     return ""
 
 
+def _replace_last_user(messages, new_content):
+    """Return a new message list with the newest user turn's content replaced.
+
+    The caller's list and dicts are not mutated — the replacement is a
+    copy. Only the rewritten dict is new; other dicts are re-referenced.
+    """
+    out = list(messages)
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            out[i] = dict(out[i], content=new_content)
+            break
+    return out
+
+
 def _rpc_post(path, payload):
     """POST JSON to the intent RPC and return the decoded response dict.
 
@@ -132,6 +146,19 @@ def _intent_lookup(text):
     if result and result.get("matched"):
         return result.get("response")
     return None
+
+
+def _enrich_text(text):
+    """Ask the intent RPC to prepend location context if applicable.
+
+    Returns the (possibly rewritten) text. On any transport error, returns
+    the original text unchanged — the LLM still gets a valid prompt, just
+    without the "you are in <city>" hint.
+    """
+    result = _rpc_post("/api/enrich", {"text": text})
+    if result and isinstance(result.get("text"), str):
+        return result["text"]
+    return text
 
 
 def _command_execute(text):
@@ -788,6 +815,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                     self._send_sse({"done": True})
                     self._send_sse_raw("data: [DONE]\n\n")
                     return
+                # Not a canned answer — see if the message references "here" /
+                # "this area" / etc. and needs a location fact injected before
+                # the LLM sees it. Rewrites only the newest user turn.
+                enriched = _enrich_text(latest_user)
+                if enriched != latest_user:
+                    trimmed = _replace_last_user(trimmed, enriched)
             self._proxy_genie_stream(trimmed, system_prompt)
         except (BrokenPipeError, ConnectionResetError):
             return
