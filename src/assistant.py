@@ -60,6 +60,22 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "")  # path to ca.pem for self-signed certs
 MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("true", "1", "yes")
 
+# Headwaters HTTP API — used for reverse-geocoding GPS coordinates into
+# "Austin, Texas" and for nearby-city lookups. Defaults to https://<MQTT_BROKER>
+# because the broker and web API live on the same in-vehicle box.
+HEADWATERS_URL = os.getenv("HEADWATERS_URL",
+    f"https://{MQTT_BROKER}" if MQTT_BROKER else "")
+# API key issued by Headwaters (Settings → API Keys). Sent in the raw
+# Authorization header on every /api/* call. Peregrine is an API client, not
+# a browser session, so it uses an api_keys record rather than a bearer token.
+# Prefix "rv_" — see backend authMiddleware.
+HEADWATERS_API_KEY = os.getenv("HEADWATERS_API_KEY", "")
+
+# Localhost intent RPC — assistant.py exposes match_intent() over this port
+# so the chat UI (web_chat.py) can run the same intent handlers the voice loop
+# does. Loopback only; not authenticated.
+INTENT_RPC_PORT = int(os.getenv("INTENT_RPC_PORT", "11435"))
+
 BASE_SYSTEM_PROMPT = (
     # Identity is intentionally terse — a small 1B model will otherwise parrot
     # the opening sentence of the system prompt as its "answer" when it can't
@@ -107,6 +123,9 @@ print(f"  STT model:  {WHISPER_SIZE}")
 print(f"  LLM model:  {OLLAMA_MODEL}")
 print(f"  TTS model:  {os.path.basename(PIPER_MODEL)}")
 print(f"  MQTT:       {MQTT_BROKER}:{MQTT_PORT}" if MQTT_BROKER else "  MQTT:       disabled")
+if HEADWATERS_URL:
+    key_state = "configured" if HEADWATERS_API_KEY else "MISSING (set HEADWATERS_API_KEY)"
+    print(f"  Headwaters: {HEADWATERS_URL}  api-key: {key_state}")
 print()
 
 print("Loading wake word model...")
@@ -2325,9 +2344,28 @@ _BATTERY_PATTERNS = [
     re.compile(r"\b(?:battery|charge|power|energy|solar|voltage)\b", re.I),
     re.compile(r"\bhow\s+much\s+(?:power|charge|battery|energy)\b", re.I),
 ]
+# "Nearby cities" and "state capital" must be checked BEFORE the generic
+# location patterns — otherwise "what cities are nearby" matches "where are we"
+# via the second _LOCATION_PATTERNS entry and never reaches the nearby handler.
+_NEARBY_CITIES_PATTERNS = [
+    re.compile(r"\b(?:cities|towns?|places?)\s+(?:are\s+)?(?:near|nearby|around)\b", re.I),
+    re.compile(r"\bnearby\s+(?:cities|towns?|places?)\b", re.I),
+    re.compile(r"\bwhat(?:'s|s|\s+is)?\s+(?:close|nearby)\b", re.I),
+    re.compile(r"\bwhat\s+towns?\s+are\s+(?:close|near)\b", re.I),
+]
+_STATE_CAPITAL_PATTERNS = [
+    re.compile(
+        r"\bcapital\s+of\s+(?:the\s+)?state\b(?:\s+(?:i(?:'m|\s+in)|(?:that\s+)?we(?:'re| are)?\s+in))?",
+        re.I,
+    ),
+    # "what state am I in" answers with just the state name — same lookup path,
+    # cheaper than the LLM guessing based on stale training data.
+    re.compile(r"\bwhat\s+state\s+(?:am\s+i|are\s+we)\s+in\b", re.I),
+]
 _LOCATION_PATTERNS = [
     re.compile(r"\b(?:location|where\s+(?:am\s+i|are\s+we)|gps|coordinates?)\b", re.I),
     re.compile(r"\bwhere\s+(?:am\s+i|are\s+we|is\s+(?:the|this))\b", re.I),
+    re.compile(r"\bwhat\s+(?:city|town)\s+(?:am\s+i|are\s+we)\s+in\b", re.I),
 ]
 _TIME_PATTERNS = [
     re.compile(r"\bwhat\s+time\b", re.I),
@@ -2408,6 +2446,9 @@ def _get_light_status_response(light_id=None):
 
     on_lights = []
     off_lights = []
+    seen_device_ids = set()
+
+    # 1) Torrent (PDM) lights — publish to local/lights/<id>/status.
     for topic, payload in sensor_data.items():
         if topic.startswith("local/lights/") and topic.endswith("/status"):
             parts = topic.split("/")
@@ -2420,11 +2461,31 @@ def _get_light_status_response(light_id=None):
                 # Only report devices of type "light"
                 if _device_types_by_id.get(lid_int) not in (None, "light"):
                     continue
+                seen_device_ids.add(lid_int)
                 name = _device_names_by_id.get(lid_int, f"light {lid}")
                 if payload.get("state") == 1:
                     on_lights.append(name)
                 else:
                     off_lights.append(name)
+
+    # 2) Switchback relay-backed lights — the trailer may drive its lights
+    # through Switchback rather than Torrent. Any device in the relay
+    # registry whose type is "light" gets folded in here so "what lights
+    # are on" reflects the actual lights the user cares about, not just
+    # the Torrent subset.
+    for dev_id, relay_ch in _relay_channel_by_id.items():
+        if _device_types_by_id.get(dev_id) != "light":
+            continue
+        if dev_id in seen_device_ids:
+            continue  # avoid double-counting if both topics somehow existed
+        payload = sensor_data.get(f"local/relays/{relay_ch}/status")
+        if not payload:
+            continue
+        name = _device_names_by_id.get(dev_id, f"light {dev_id}")
+        if payload.get("state") == 1:
+            on_lights.append(name)
+        else:
+            off_lights.append(name)
 
     if not on_lights and not off_lights:
         return "I don't have light status data right now."
@@ -2519,6 +2580,127 @@ def _next_dst_transition(tz_name, now_utc):
             prev_offset = cur_offset
     except Exception:
         pass
+    return None
+
+
+# US state / territory → capital lookup. Used by the "capital of the state
+# I'm in" intent — reverse-geocode returns the region name (e.g. "Texas") and
+# we look it up here so the small on-device LLM doesn't have to guess from
+# stale training data. Non-US regions fall through to the LLM.
+_STATE_CAPITALS = {
+    "Alabama": "Montgomery", "Alaska": "Juneau", "Arizona": "Phoenix",
+    "Arkansas": "Little Rock", "California": "Sacramento", "Colorado": "Denver",
+    "Connecticut": "Hartford", "Delaware": "Dover", "Florida": "Tallahassee",
+    "Georgia": "Atlanta", "Hawaii": "Honolulu", "Idaho": "Boise",
+    "Illinois": "Springfield", "Indiana": "Indianapolis", "Iowa": "Des Moines",
+    "Kansas": "Topeka", "Kentucky": "Frankfort", "Louisiana": "Baton Rouge",
+    "Maine": "Augusta", "Maryland": "Annapolis", "Massachusetts": "Boston",
+    "Michigan": "Lansing", "Minnesota": "Saint Paul", "Mississippi": "Jackson",
+    "Missouri": "Jefferson City", "Montana": "Helena", "Nebraska": "Lincoln",
+    "Nevada": "Carson City", "New Hampshire": "Concord", "New Jersey": "Trenton",
+    "New Mexico": "Santa Fe", "New York": "Albany", "North Carolina": "Raleigh",
+    "North Dakota": "Bismarck", "Ohio": "Columbus", "Oklahoma": "Oklahoma City",
+    "Oregon": "Salem", "Pennsylvania": "Harrisburg", "Rhode Island": "Providence",
+    "South Carolina": "Columbia", "South Dakota": "Pierre", "Tennessee": "Nashville",
+    "Texas": "Austin", "Utah": "Salt Lake City", "Vermont": "Montpelier",
+    "Virginia": "Richmond", "Washington": "Olympia", "West Virginia": "Charleston",
+    "Wisconsin": "Madison", "Wyoming": "Cheyenne",
+    "District of Columbia": "Washington",
+    "Puerto Rico": "San Juan", "Guam": "Hagåtña",
+    "U.S. Virgin Islands": "Charlotte Amalie",
+    "American Samoa": "Pago Pago",
+    "Northern Mariana Islands": "Saipan",
+}
+
+
+# --- Geocode client ---
+#
+# Caches keyed on the current GPS fix rounded to ~1 km. The RV moves, but not
+# fast enough that Austin becomes Round Rock between one voice query and the
+# next. Cache also protects against the geocoder container being briefly
+# unreachable during a Headwaters restart.
+
+_GEOCODE_CACHE_TTL = 300  # seconds
+_reverse_cache = {"key": None, "value": None, "expires_at": 0.0}
+_nearby_cache = {"key": None, "value": None, "expires_at": 0.0}
+
+
+def _current_gps_fix():
+    gps = sensor_data.get("local/gps/latlon")
+    if not gps:
+        return None
+    lat = gps.get("latitude")
+    lon = gps.get("longitude")
+    if lat is None or lon is None:
+        return None
+    return float(lat), float(lon)
+
+
+def _round_key(lat, lon):
+    # ~1 km cache buckets — coarse enough to hit the cache across successive
+    # queries at the same campsite, fine enough that highway-speed movement
+    # invalidates within a minute.
+    return (round(lat, 2), round(lon, 2))
+
+
+def _headwaters_get(path, timeout=3.0):
+    """GET a Headwaters API path. Returns (status, body_dict) or (None, None).
+
+    Uses MQTT_CA_CERT for TLS verification when set (self-signed in-vehicle
+    cert) and sends HEADWATERS_API_KEY as the Authorization header so the
+    request clears the backend's authMiddleware. Returns None on any failure
+    — callers fall back gracefully.
+    """
+    if not HEADWATERS_URL:
+        return None, None
+    url = HEADWATERS_URL.rstrip("/") + path
+    headers = {}
+    if HEADWATERS_API_KEY:
+        # Backend authMiddleware accepts the raw api key as the Authorization
+        # header value (not "Bearer <key>") — see routes/auth.js.
+        headers["Authorization"] = HEADWATERS_API_KEY
+    try:
+        verify = MQTT_CA_CERT if MQTT_CA_CERT else False
+        resp = requests.get(url, timeout=timeout, headers=headers, verify=verify)
+        return resp.status_code, resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"  Geocode request failed ({path}): {e}")
+        return None, None
+
+
+def _reverse_geocode(lat, lon):
+    now = time.time()
+    key = _round_key(lat, lon)
+    if _reverse_cache["key"] == key and _reverse_cache["expires_at"] > now:
+        return _reverse_cache["value"]
+    status, body = _headwaters_get(
+        f"/api/geocode/reverse?lat={lat}&lon={lon}"
+    )
+    if status == 200 and isinstance(body, dict) and body.get("place"):
+        _reverse_cache.update({
+            "key": key, "value": body,
+            "expires_at": now + _GEOCODE_CACHE_TTL,
+        })
+        return body
+    return None
+
+
+def _nearby_cities(lat, lon, limit=5, radius_km=100):
+    now = time.time()
+    key = (_round_key(lat, lon), limit, radius_km)
+    if _nearby_cache["key"] == key and _nearby_cache["expires_at"] > now:
+        return _nearby_cache["value"]
+    status, body = _headwaters_get(
+        f"/api/geocode/nearby?lat={lat}&lon={lon}"
+        f"&limit={limit}&radius_km={radius_km}"
+    )
+    if status == 200 and isinstance(body, dict):
+        results = body.get("results") or []
+        _nearby_cache.update({
+            "key": key, "value": results,
+            "expires_at": now + _GEOCODE_CACHE_TTL,
+        })
+        return results
     return None
 
 
@@ -2805,13 +2987,81 @@ def match_intent(text):
                     return response.strip()
             return "I don't have energy data right now."
 
+    # Nearby-cities and state-capital run before the generic location patterns
+    # so "what cities are nearby" and "capital of the state I'm in" don't get
+    # eaten by the "where are we" catch-all.
+    for pattern in _NEARBY_CITIES_PATTERNS:
+        if pattern.search(text):
+            print("  Intent: nearby cities query")
+            fix = _current_gps_fix()
+            if not fix:
+                return "I don't have location data right now."
+            results = _nearby_cities(*fix, limit=5, radius_km=100)
+            if results is None:
+                return "I couldn't reach the map service to look up nearby cities."
+            if not results:
+                return "There are no cities within a hundred kilometers."
+            phrases = []
+            for r in results:
+                name = r.get("place")
+                dist_km = r.get("distance_km") or 0
+                miles = dist_km * 0.621371
+                if name:
+                    phrases.append(f"{name}, about {miles:.0f} miles away")
+            if not phrases:
+                return "I couldn't find any nearby cities."
+            if len(phrases) == 1:
+                return f"The nearest city is {phrases[0]}."
+            return "Nearby cities are " + ", ".join(phrases[:-1]) + ", and " + phrases[-1] + "."
+
+    for pattern in _STATE_CAPITAL_PATTERNS:
+        if pattern.search(text):
+            fix = _current_gps_fix()
+            if not fix:
+                return "I don't have location data right now."
+            place = _reverse_geocode(*fix)
+            if not place:
+                return "I couldn't reach the map service to look up your location."
+            region = (place.get("region") or "").strip()
+            if not region:
+                return "I couldn't tell what state you're in."
+            # "what state am I in" — different phrasing gets a different answer.
+            if re.search(r"\bwhat\s+state\b", text, re.I):
+                print("  Intent: state query")
+                return f"You're in {region}."
+            print(f"  Intent: state capital query (region={region})")
+            capital = _STATE_CAPITALS.get(region)
+            if capital:
+                return f"The capital of {region} is {capital}."
+            return f"You're in {region}, but I don't have its capital on hand."
+
     for pattern in _LOCATION_PATTERNS:
         if pattern.search(text):
             print("  Intent: location query")
-            gps = sensor_data.get("local/gps/latlon")
-            if gps and gps.get("latitude") is not None:
-                return f"We're at latitude {gps['latitude']}, longitude {gps['longitude']}."
-            return "I don't have location data right now."
+            fix = _current_gps_fix()
+            if not fix:
+                return "I don't have location data right now."
+            lat, lon = fix
+            place = _reverse_geocode(lat, lon)
+            if place and place.get("place"):
+                city = place["place"]
+                region = (place.get("region") or "").strip()
+                country = (place.get("country") or "").strip()
+                cc = (place.get("cc") or "").strip()
+                # US: "Austin, Texas". Non-US: "Toronto, Ontario, Canada".
+                # No region: fall back to city + country.
+                if cc == "US" and region:
+                    return f"We're in {city}, {region}."
+                if region and country and country != region:
+                    return f"We're in {city}, {region}, {country}."
+                if region:
+                    return f"We're in {city}, {region}."
+                if country:
+                    return f"We're in {city}, {country}."
+                return f"We're in {city}."
+            # Geocoder unreachable — keep the old coordinate answer so we
+            # never lose the ability to answer this at all.
+            return f"We're at latitude {lat}, longitude {lon}."
 
     for pattern in _TIME_PATTERNS:
         if pattern.search(text):
@@ -3025,6 +3275,122 @@ def handle_command(response_text):
         return _execute_light_command(device_id, state)
 
     return None
+
+
+# --- Intent RPC (loopback HTTP) ---
+#
+# The chat UI (web_chat.py) runs as a separate process but needs the same
+# device-status / device-control / geocode intents the voice loop already
+# handles. Rather than duplicate the MQTT client and cached sensor state, we
+# expose a tiny loopback-only HTTP server here that the chat process can call.
+#
+# Two endpoints:
+#   POST /api/intent   {"text":"..."} → {"matched":bool,"response":str|None}
+#     runs match_intent() — canned answers for known question shapes and
+#     device commands.
+#   POST /api/command  {"text":"..."} → {"executed":bool,"confirmation":str|None}
+#     runs handle_command() on an LLM's raw JSON output — for when the chat
+#     forwards the message to the NPU LLM first and the model produces a
+#     control command instead of prose.
+#
+# Bound to 127.0.0.1 only. No auth — anything with local shell access already
+# has the MQTT credentials.
+
+def _start_intent_rpc():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from socketserver import ThreadingMixIn
+
+    class IntentHandler(BaseHTTPRequestHandler):
+        server_version = "PeregrineIntentRPC/1.0"
+
+        def _read_json(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if not length:
+                return None
+            try:
+                return json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, ValueError):
+                return None
+
+        def _send_json(self, obj, status=200):
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            body = self._read_json()
+            if not isinstance(body, dict):
+                self._send_json({"error": "invalid JSON"}, status=400)
+                return
+            text = (body.get("text") or "").strip()
+            if not text:
+                self._send_json({"error": "missing 'text'"}, status=400)
+                return
+            if self.path == "/api/intent":
+                try:
+                    resp = match_intent(text)
+                except Exception as e:
+                    print(f"[intent-rpc] match_intent error: {e}")
+                    resp = None
+                self._send_json({"matched": bool(resp), "response": resp})
+                return
+            if self.path == "/api/command":
+                try:
+                    confirmation = handle_command(text)
+                except Exception as e:
+                    print(f"[intent-rpc] handle_command error: {e}")
+                    confirmation = None
+                self._send_json({
+                    "executed": bool(confirmation),
+                    "confirmation": confirmation,
+                })
+                return
+            self._send_json({"error": "not found"}, status=404)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self._send_json({"ok": True})
+                return
+            if self.path == "/debug/state":
+                # Dumps what the assistant's MQTT client has actually received.
+                # Used to diagnose "the intent says no data" when Headwaters is
+                # visibly publishing — usually MQTT auth/scope mismatch.
+                gps = sensor_data.get("local/gps/latlon")
+                self._send_json({
+                    "mqtt_broker": MQTT_BROKER,
+                    "mqtt_port": MQTT_PORT,
+                    "mqtt_connected": _mqtt_connected.is_set(),
+                    "sensor_topics": sorted(sensor_data.keys()),
+                    "gps_latlon": gps,
+                    "headwaters_url": HEADWATERS_URL,
+                })
+                return
+            self._send_json({"error": "not found"}, status=404)
+
+        def log_message(self, fmt, *args):
+            # Keep RPC noise off the assistant's console.
+            pass
+
+    class ThreadedHTTP(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    try:
+        server = ThreadedHTTP(("127.0.0.1", INTENT_RPC_PORT), IntentHandler)
+    except OSError as e:
+        print(f"[intent-rpc] cannot bind 127.0.0.1:{INTENT_RPC_PORT}: {e}")
+        return
+    print(f"[intent-rpc] listening on 127.0.0.1:{INTENT_RPC_PORT}")
+    server.serve_forever()
+
+
+_intent_rpc_thread = threading.Thread(
+    target=_start_intent_rpc, daemon=True, name="intent-rpc",
+)
+_intent_rpc_thread.start()
 
 
 # --- Audio functions using arecord/aplay ---

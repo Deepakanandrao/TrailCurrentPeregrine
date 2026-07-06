@@ -205,6 +205,9 @@ All settings are controlled via environment variables. On the board, site-specif
 | `MQTT_CA_CERT` | *(empty)* | Path to CA certificate for self-signed certs |
 | `MQTT_USERNAME` | *(empty)* | MQTT authentication username |
 | `MQTT_PASSWORD` | *(empty)* | MQTT authentication password |
+| `HEADWATERS_URL` | `https://<MQTT_BROKER>` | Base URL of the Headwaters REST API |
+| `HEADWATERS_API_KEY` | *(empty)* | `rv_...` API key from Headwaters → Settings → API Keys. Required for the "where am I", "nearby cities", and "capital of the state I'm in" intents (falls back to raw lat/lon without one). |
+| `INTENT_RPC_PORT` | `11435` | Loopback port the chat UI uses to reach the intent handler |
 
 ## MQTT Topics
 

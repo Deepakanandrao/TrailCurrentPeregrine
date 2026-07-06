@@ -45,6 +45,12 @@ from socketserver import ThreadingMixIn
 HOST = os.getenv("WEB_CHAT_HOST", "0.0.0.0")
 GENIE_URL = os.getenv("GENIE_URL", "http://127.0.0.1:11434")
 
+# Intent RPC exposed by assistant.py — lets the chat run the same device-status,
+# device-control, and geocode intents the voice loop uses. If unreachable
+# (assistant.py not running, wrong port), we transparently fall back to LLM only.
+INTENT_RPC_URL = os.getenv("INTENT_RPC_URL", "http://127.0.0.1:11435")
+INTENT_RPC_TIMEOUT = float(os.getenv("INTENT_RPC_TIMEOUT", "1.5"))
+
 # TLS — when WEB_CHAT_TLS_CERT and WEB_CHAT_TLS_KEY are set the main listener
 # wraps its socket with SSL and listens on WEB_CHAT_HTTPS_PORT (default 443).
 # A second listener on WEB_CHAT_HTTP_PORT (default 80) serves /ca.pem in the
@@ -65,8 +71,19 @@ PORT = int(os.getenv("WEB_CHAT_PORT", "80"))
 
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "WEB_CHAT_SYSTEM",
-    "You are Peregrine, a helpful local voice and chat assistant running "
-    "on-device for the TrailCurrent platform. Reply concisely.",
+    # The chat process consults an intent RPC before this prompt ever reaches
+    # the LLM — sensor readings, device control, and location queries are
+    # answered from live MQTT / GPS state, not from the model. Tell the model
+    # so it doesn't reflexively disclaim ("I can't see the physical
+    # environment") when a fallback prose answer is warranted.
+    "You are Peregrine, a helpful on-device voice and chat assistant for the "
+    "TrailCurrent platform. You have access to live vehicle sensor data and "
+    "device controls (lights, relays, radio, thermostat, GPS location, air "
+    "quality, battery, water tanks) which are handled by a separate intent "
+    "layer before your response is used — never claim you can't see the "
+    "physical environment. If a question about the vehicle reaches you here, "
+    "answer conversationally from general knowledge; the intent layer will "
+    "have already handled anything requiring live data. Reply concisely.",
 )
 
 # Llama3.2-1B-1024-v68 has a 1024-token context. Leave room for the new
@@ -79,6 +96,53 @@ RESPONSE_RESERVE_TOKENS = 200
 def _approx_tokens(text: str) -> int:
     """Rough character-based token estimate. Good enough for trimming."""
     return max(1, len(text) // 4)
+
+
+def _latest_user_text(messages):
+    """Return the newest user message's content, or '' if none."""
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return m["content"].strip()
+    return ""
+
+
+def _rpc_post(path, payload):
+    """POST JSON to the intent RPC and return the decoded response dict.
+
+    Returns None on any transport error — callers treat that as "no match"
+    so the chat still works when assistant.py isn't running.
+    """
+    try:
+        req = urllib.request.Request(
+            INTENT_RPC_URL.rstrip("/") + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=INTENT_RPC_TIMEOUT) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as e:
+        print(f"[web-chat] intent RPC unavailable ({path}): {e}", file=sys.stderr)
+        return None
+
+
+def _intent_lookup(text):
+    """Return a canned response string if the intent RPC matches, else None."""
+    result = _rpc_post("/api/intent", {"text": text})
+    if result and result.get("matched"):
+        return result.get("response")
+    return None
+
+
+def _command_execute(text):
+    """Run handle_command on the LLM's JSON output via the RPC.
+
+    Returns the spoken confirmation or None if the JSON couldn't be executed.
+    """
+    result = _rpc_post("/api/command", {"text": text})
+    if result and result.get("executed"):
+        return result.get("confirmation")
+    return None
 
 
 def _trim_messages(messages, system_prompt):
@@ -712,12 +776,31 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         try:
+            # Try the intent RPC first — the same fast-path the voice loop uses.
+            # If it matches, we're done (no LLM call). Otherwise fall through
+            # to the LLM and, if the LLM emits a JSON control command, feed it
+            # to the RPC /api/command endpoint so lights actually turn on.
+            latest_user = _latest_user_text(trimmed)
+            if latest_user:
+                canned = _intent_lookup(latest_user)
+                if canned:
+                    self._send_sse({"delta": canned})
+                    self._send_sse({"done": True})
+                    self._send_sse_raw("data: [DONE]\n\n")
+                    return
             self._proxy_genie_stream(trimmed, system_prompt)
         except (BrokenPipeError, ConnectionResetError):
             return
 
     def _proxy_genie_stream(self, messages, system_prompt):
-        """Stream tokens from genie-server's /api/chat and forward as SSE."""
+        """Stream tokens from genie-server's /api/chat and forward as SSE.
+
+        Watches the first non-whitespace character of the stream — if it's
+        ``{`` the model is emitting a device-control JSON command, which the
+        UI shouldn't show verbatim. We buffer the whole response, hand it to
+        the intent RPC's /api/command endpoint (same code path the voice loop
+        uses), and stream back the resulting spoken confirmation instead.
+        """
         payload = json.dumps({
             "messages": messages,
             "system": system_prompt,
@@ -729,6 +812,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        buffered = []          # holds full response when we suspect JSON
+        looks_like_json = None # None until we see first non-whitespace char
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 for raw in resp:
@@ -740,11 +825,24 @@ class ChatHandler(BaseHTTPRequestHandler):
                     except json.JSONDecodeError:
                         continue
                     if evt.get("done"):
+                        if looks_like_json:
+                            full = "".join(buffered)
+                            confirmation = _command_execute(full)
+                            reply = confirmation or "Sorry, I couldn't do that."
+                            self._send_sse({"delta": reply})
                         self._send_sse({"done": True})
                         self._send_sse_raw("data: [DONE]\n\n")
                         return
                     delta = evt.get("response") or ""
-                    if delta:
+                    if not delta:
+                        continue
+                    if looks_like_json is None:
+                        stripped = delta.lstrip()
+                        if stripped:
+                            looks_like_json = stripped.startswith("{")
+                    if looks_like_json:
+                        buffered.append(delta)
+                    else:
                         self._send_sse({"delta": delta})
         except urllib.error.URLError as e:
             self._send_sse({"error": f"NPU backend unavailable: {e.reason}"})
