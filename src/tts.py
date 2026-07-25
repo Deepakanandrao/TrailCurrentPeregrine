@@ -23,13 +23,14 @@ fails for any reason.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import subprocess
 import threading
 import time
 import wave
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 try:
     from piper import PiperVoice
@@ -132,6 +133,38 @@ class TTSEngine:
             except Exception:
                 pass
             return None
+
+    def render_to_wav_bytes(self, text: str) -> Tuple[int, bytes]:
+        """Synthesize `text` and return `(sample_rate, wav_bytes)` in-memory.
+
+        Used by the /api/voice HTTP endpoint — the CrowPanel P4 wants the
+        response as a WAV body it can decode and hand to its I2S DAC, not
+        aplay'd locally. No cache is consulted or updated (LLM replies are
+        unique per turn; caching would just fill the disk).
+        """
+        text = text.strip()
+        if not text:
+            return (self._sample_rate, b"")
+        if not self.load():
+            raise RuntimeError("PiperVoice unavailable")
+        collected = bytearray()
+        first_sr = None
+        with self._lock:
+            for chunk in self._voice.synthesize(text):
+                pcm = chunk.audio_int16_bytes
+                if not pcm:
+                    continue
+                if first_sr is None:
+                    first_sr = chunk.sample_rate
+                collected.extend(pcm)
+        sr = first_sr or self._sample_rate
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(self._sample_width)
+            wf.setframerate(sr)
+            wf.writeframes(bytes(collected))
+        return (sr, buf.getvalue())
 
     def warm_cache(self, phrases: Iterable[str], background: bool = True) -> None:
         """Pre-render each phrase into the cache.

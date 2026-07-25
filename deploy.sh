@@ -60,10 +60,11 @@ echo "[1/6] Refreshing openwakeword + timezonefinder..."
 $SSH "$TARGET" "${REMOTE_HOME}/assistant-env/bin/pip install -q --force-reinstall --no-deps openwakeword 2>&1 | tail -1"
 $SSH "$TARGET" "${REMOTE_HOME}/assistant-env/bin/pip install -q timezonefinder 2>&1 | tail -1"
 
-# ── 2. assistant.py + tts.py ────────────────────────────────────────────────
-echo "[2/6] Copying assistant.py + tts.py..."
+# ── 2. assistant.py + tts.py + stt.py ───────────────────────────────────────
+echo "[2/6] Copying assistant.py + tts.py + stt.py..."
 $SCP "${SCRIPT_DIR}/src/assistant.py" "${TARGET}:${REMOTE_HOME}/assistant.py"
 $SCP "${SCRIPT_DIR}/src/tts.py"        "${TARGET}:${REMOTE_HOME}/tts.py"
+$SCP "${SCRIPT_DIR}/src/stt.py"        "${TARGET}:${REMOTE_HOME}/stt.py"
 
 # ── 3. genie_server.py ──────────────────────────────────────────────────────
 echo "[3/6] Copying genie_server.py..."

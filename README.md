@@ -23,6 +23,13 @@ Entirely offline voice pipeline:
    serves `/ca.pem` unencrypted so first-time clients can install the CA
    before completing a TLS handshake. The chat backend proxies to
    `genie-server` on loopback.
+7. **Voice terminal endpoint** — `POST http://peregrine.local:8081/api/voice`
+   accepts a WAV upload, runs STT → intent-or-LLM → TTS on-board, and returns
+   a WAV of the spoken reply. Lets a dumb remote push-to-talk device (e.g.
+   the CrowPanel Advance ESP32-P4) act as a mic/speaker for Peregrine
+   without needing a wake word or a separate ML pipeline. Bearer-token
+   gated, LAN-only, disabled by default — see
+   [docs/voice-terminal.md](docs/voice-terminal.md) for setup.
 
 All processing happens on-device. No cloud services required for the core loop.
 
@@ -66,8 +73,9 @@ TrailCurrentPeregrine/
 ├── src/
 │   ├── assistant.py                Main voice assistant loop
 │   ├── genie_server.py             NPU LLM HTTP server (loopback)
+│   ├── stt.py                      Reusable faster-whisper wrapper (used by web_chat.py)
 │   ├── tts.py                      Piper TTS streaming helper
-│   └── web_chat.py                 LAN-facing chat UI (port 80, proxies genie)
+│   └── web_chat.py                 LAN-facing chat UI (443) + voice terminal endpoint (8081)
 │
 ├── config/
 │   ├── voice-assistant.service     systemd unit (canonical, baked into image)
@@ -180,6 +188,8 @@ With MQTT connected, the assistant responds to:
 
 Device commands and sensor queries use fast regex-based intent matching (no LLM round-trip). Unrecognized requests fall through to the LLM.
 
+The same intent + LLM path is exposed over HTTP at `POST /api/voice` on port 8081, letting a push-to-talk remote (e.g. the CrowPanel Advance ESP32-P4) act as a mic/speaker for Peregrine without shipping any ML on the client side. See [docs/voice-terminal.md](docs/voice-terminal.md) to enable and test.
+
 Device names are configured in the TrailCurrent web UI and synced via MQTT. Both Torrent (PWM lights) and Switchback (relays) devices are supported. Only Torrent lights support brightness — Switchback relays are on/off only. When you say "turn off all the lights", both Torrent lights and any Switchback relays configured as type "light" are turned off.
 
 ## Configuration
@@ -208,6 +218,10 @@ All settings are controlled via environment variables. On the board, site-specif
 | `HEADWATERS_URL` | `https://<MQTT_BROKER>` | Base URL of the Headwaters REST API |
 | `HEADWATERS_API_KEY` | *(empty)* | `rv_...` API key from Headwaters → Settings → API Keys. Required for the "where am I", "nearby cities", and "capital of the state I'm in" intents (falls back to raw lat/lon without one). |
 | `INTENT_RPC_PORT` | `11435` | Loopback port the chat UI uses to reach the intent handler |
+| `PEREGRINE_VOICE_PORT` | `8081` | LAN listener for the `/api/voice` push-to-talk endpoint |
+| `PEREGRINE_VOICE_TOKEN` | *(empty = disabled)* | Bearer token required on every `/api/voice` request. See [docs/voice-terminal.md](docs/voice-terminal.md) |
+| `PEREGRINE_VOICE_MAX_BYTES` | `1048576` | Upload body cap (~30 sec of 16 kHz mono) |
+| `PEREGRINE_VOICE_TARGET_SR` | `16000` | Sample rate of the returned WAV (match the client codec) |
 
 ## MQTT Topics
 

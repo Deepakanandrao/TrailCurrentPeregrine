@@ -72,6 +72,12 @@ CLAUDE.MD
 *.key
 *.crt
 
+# /api/voice bearer token (shared secret between web_chat.py and the ESP32
+# terminal). Local scratch copies live at repo root or ~/.peregrine-voice-token
+# — neither belongs in git.
+peregrine-voice-token
+.peregrine-voice-token
+
 # Training caches (downloaded datasets — large, reproducible)
 training/.mssnsd_cache/
 training/.musan_cache/

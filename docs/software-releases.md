@@ -22,11 +22,15 @@ goes out to every board in the field.
 `deploy.sh` pushes exactly this set (and nothing else):
 
 - `src/assistant.py`
+- `src/stt.py`
 - `src/tts.py`
 - `src/genie_server.py`
+- `src/web_chat.py`
 - `models/hey_peregrine.onnx` (+ `.data`)
 - `config/voice-assistant.service`
 - `config/genie-server.service`
+- `config/peregrine-chat.service`
+- `scripts/generate-certs.sh`
 - `image_build/files/systemd/cpu-performance.service`
 - A `pip install --force-reinstall --no-deps openwakeword`
 - A `pip install timezonefinder`
@@ -111,6 +115,17 @@ restart if `genie_server.py` or `genie-server.service` changed:
 ```bash
 ssh -t trailcurrent@peregrine.local sudo systemctl restart genie-server
 ```
+
+If `web_chat.py`, `stt.py`, or `peregrine-chat.service` changed (which
+includes the `/api/voice` voice-terminal endpoint), also restart the chat
+service:
+
+```bash
+ssh -t trailcurrent@peregrine.local sudo systemctl restart peregrine-chat
+```
+
+First-time setup of the `/api/voice` endpoint (bearer token drop-in) is a
+separate one-shot step — see [voice-terminal.md](voice-terminal.md).
 
 For multiple boards, loop:
 

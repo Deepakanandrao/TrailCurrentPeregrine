@@ -30,13 +30,18 @@ here to fit the model's 1024-token context window before forwarding to
 genie-server's /api/chat endpoint.
 """
 
+import hmac
+import io
 import json
 import os
+import re
 import ssl
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
+import wave
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -69,6 +74,29 @@ PUBLIC_HOSTNAME = os.getenv("WEB_CHAT_PUBLIC_HOSTNAME", "")
 # Legacy/override single port — only honored when TLS is OFF.
 PORT = int(os.getenv("WEB_CHAT_PORT", "80"))
 
+# --- Voice-terminal endpoint (CrowPanel P4 push-to-talk) ---
+# When PEREGRINE_VOICE_TOKEN is set, we open an additional plain-HTTP
+# listener on PEREGRINE_VOICE_PORT (default 8081) that accepts a WAV upload,
+# transcribes it, runs the same intent-then-LLM path the chat UI uses, and
+# returns a WAV of the spoken reply. Trust boundary is LAN + shared bearer
+# token — the ESP32 firmware can't practically ship the self-signed TLS CA
+# for the HTTPS listener, and both boxes live on the same in-vehicle network.
+VOICE_PORT = int(os.getenv("PEREGRINE_VOICE_PORT", "8081"))
+VOICE_TOKEN = os.getenv("PEREGRINE_VOICE_TOKEN", "")
+VOICE_ENABLED = bool(VOICE_TOKEN)
+VOICE_MAX_BYTES = int(os.getenv("PEREGRINE_VOICE_MAX_BYTES", str(1024 * 1024)))
+VOICE_TARGET_SR = int(os.getenv("PEREGRINE_VOICE_TARGET_SR", "16000"))
+PIPER_MODEL_PATH = os.getenv(
+    "PIPER_MODEL",
+    os.path.expanduser("~/piper-voices/en_US-libritts_r-medium.onnx"),
+)
+
+# Lazily initialized on first /api/voice request so the chat UI can start
+# even if faster-whisper / Piper are missing on the box.
+_stt_engine = None
+_tts_engine = None
+_engines_lock = threading.Lock()
+
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "WEB_CHAT_SYSTEM",
     # The chat process consults an intent RPC before this prompt ever reaches
@@ -84,6 +112,17 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
     "physical environment. If a question about the vehicle reaches you here, "
     "answer conversationally from general knowledge; the intent layer will "
     "have already handled anything requiring live data. Reply concisely.",
+)
+
+# The voice path (Piper TTS) reads every character aloud, including markdown
+# punctuation the chat UI would render invisibly. Append a plain-speech
+# instruction only for LLM calls whose response goes to TTS — keep the chat
+# UI's system prompt unchanged so it can still emit formatted answers.
+VOICE_SYSTEM_PROMPT = os.getenv(
+    "WEB_CHAT_VOICE_SYSTEM",
+    DEFAULT_SYSTEM_PROMPT + " Respond in plain spoken English — no markdown, "
+    "no headings, no bullet points, no asterisks, no code blocks. Use short "
+    "sentences.",
 )
 
 # Llama3.2-1B-1024-v68 has a 1024-token context. Leave room for the new
@@ -895,6 +934,548 @@ class ChatHandler(BaseHTTPRequestHandler):
         sys.stdout.flush()
 
 
+def _get_engines():
+    """Return (stt_engine, tts_engine), loading them once per process."""
+    global _stt_engine, _tts_engine
+    with _engines_lock:
+        if _stt_engine is None:
+            from stt import STTEngine
+            _stt_engine = STTEngine()
+            _stt_engine.load()
+        if _tts_engine is None:
+            from tts import TTSEngine
+            _tts_engine = TTSEngine(PIPER_MODEL_PATH)
+            _tts_engine.load()
+    return _stt_engine, _tts_engine
+
+
+def _resample_pcm_s16_mono(pcm: bytes, src_sr: int, dst_sr: int) -> bytes:
+    """Downsample/upsample S16LE mono PCM. Uses stdlib audioop.ratecv.
+
+    audioop is deprecated but still present through Python 3.13 (Peregrine
+    runs 3.12 on Ubuntu 24.04). If it disappears in a future Python we
+    fall back to a coarse linear resample so the endpoint stays functional.
+    """
+    if src_sr == dst_sr or not pcm:
+        return pcm
+    try:
+        import audioop  # noqa: PLC0415
+        converted, _ = audioop.ratecv(pcm, 2, 1, src_sr, dst_sr, None)
+        return converted
+    except ImportError:
+        # Fallback: nearest-neighbor pick — quality drop, but audible.
+        import array
+        samples = array.array("h")
+        samples.frombytes(pcm)
+        step = src_sr / dst_sr
+        out = array.array("h")
+        i = 0.0
+        n = len(samples)
+        while int(i) < n:
+            out.append(samples[int(i)])
+            i += step
+        return out.tobytes()
+
+
+def _wav_from_pcm(pcm: bytes, sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _pcm_from_wav(wav_bytes):
+    """Return (pcm_bytes, sample_rate) from an S16LE mono WAV.
+
+    Raises ValueError on a malformed or non-conforming WAV so the endpoint
+    can 400 instead of shipping garbage into Piper's resampler.
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        if wf.getnchannels() != 1:
+            raise ValueError(f"expected mono, got {wf.getnchannels()} channels")
+        if wf.getsampwidth() != 2:
+            raise ValueError(f"expected 16-bit, got {wf.getsampwidth() * 8}-bit")
+        pcm = wf.readframes(wf.getnframes())
+        return pcm, wf.getframerate()
+
+
+## Known faster-whisper base.en hallucinations on silence / hum / short
+## clips. Case-insensitive exact-match after stripping punctuation.
+## Sources: OpenAI Whisper issue tracker + observed on this device.
+_WHISPER_HALLUCINATIONS = frozenset(s.lower() for s in (
+    "you", "you.",
+    "thanks for watching",
+    "thanks for watching!",
+    "thank you for watching",
+    "thank you.",
+    "thanks.",
+    "music", "music playing",
+    "[music]", "[music playing]",
+    ".", "!", "?", "-", "--", "...",
+    "bye", "bye.", "bye bye", "bye-bye",
+    "okay", "ok",
+    "uh", "um", "hmm", "mm", "mm.", "hmm.",
+    "the", "a", "and",
+))
+def _is_whisper_hallucination(text: str) -> bool:
+    if not text:
+        return True
+    # If the transcript is only punctuation + whitespace (e.g. ". . . . ."
+    # or "!!!" — Whisper's classic output on near-silence), drop it.
+    if not any(ch.isalnum() for ch in text):
+        return True
+    t = text.strip().lower().rstrip(".,!?;:")
+    if not t:
+        return True
+    if t in _WHISPER_HALLUCINATIONS:
+        return True
+    # Very short single-token utterances that aren't actual commands
+    # tend to be noise. 3 chars or fewer with no vowels is basically
+    # always garbage from a MEMS mic (short pop, keyboard click, etc.).
+    if len(t) <= 3 and not any(ch in "aeiouy" for ch in t):
+        return True
+    return False
+
+
+def _wav_header_bytes(sample_rate: int, data_size: int) -> bytes:
+    """Standard 44-byte PCM/mono/16-bit WAV header.
+
+    For streaming responses where the total data size isn't known up
+    front, pass data_size=0xFFFFFFFF — most decoders (including our
+    ESP32 client, which only skips the first 44 bytes and streams the
+    rest into I2S) don't inspect the size field.
+    """
+    import struct
+    return (
+        b"RIFF"
+        + struct.pack("<I", (36 + data_size) & 0xFFFFFFFF)
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+        + b"data"
+        + struct.pack("<I", data_size & 0xFFFFFFFF)
+    )
+
+
+# Markdown / formatting characters that Piper reads aloud verbatim
+# ("asterisk", "pound", "underscore", ...) if left in the LLM output.
+# The system prompt asks the model to skip them, but small models
+# (llama3.2-1B on Genie NPU) don't reliably comply — so we also strip
+# defensively here before every synthesis call.
+_MD_CODE_FENCE     = re.compile(r"```[\s\S]*?```")
+_MD_INLINE_CODE    = re.compile(r"`([^`]*)`")
+_MD_LINK           = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_LINE_STRUCTURE = re.compile(r"^\s*(?:>+|[#]{1,6}|[-*+])\s+", re.MULTILINE)
+_MD_STRIP_TRANS    = str.maketrans("", "", "*_`~#|<>{}[]\\")
+
+
+def _strip_for_tts(text: str) -> str:
+    """Remove markdown/formatting characters Piper would read aloud.
+
+    Belt-and-suspenders for the voice pipeline — the system prompt asks
+    the LLM to output plain speech, but this catches cases where it
+    slips into markdown anyway (headings, bullets, **bold**, `code`,
+    [link text](url), etc.).
+    """
+    if not text:
+        return text
+    # Fenced code blocks — replace with a spoken placeholder rather than
+    # dumping raw code into TTS, which produces a torrent of "backslash n"
+    # / "curly brace" audio.
+    text = _MD_CODE_FENCE.sub(" (code block) ", text)
+    # [text](url) -> text ; then `inline code` -> inline code
+    text = _MD_LINK.sub(r"\1", text)
+    text = _MD_INLINE_CODE.sub(r"\1", text)
+    # Strip line-leading structure: > blockquote, # headings, - / * bullets
+    text = _MD_LINE_STRUCTURE.sub("", text)
+    # Strip remaining pure-formatting characters. NOT stripped (they carry
+    # spoken meaning): & @ % $ + = / and normal sentence punctuation.
+    text = text.translate(_MD_STRIP_TRANS)
+    # Collapse whitespace introduced by removals.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _stream_piper_pcm(tts, text: str, target_sr: int):
+    """Synthesize `text` with Piper and yield 22.05 kHz mono PCM bytes.
+
+    Uses PiperVoice.synthesize() directly (tts.py's underlying engine)
+    so we can emit chunks as they're produced instead of waiting for
+    the whole sentence to finish. Resamples per-chunk when target_sr
+    differs from Piper's native rate.
+    """
+    text = _strip_for_tts(text)
+    if not text:
+        return
+    if not tts.load():
+        return
+    src_rate = tts._sample_rate
+    resample_state = None
+    with tts._lock:
+        for chunk in tts._voice.synthesize(text):
+            pcm = chunk.audio_int16_bytes
+            if not pcm:
+                continue
+            chunk_sr = chunk.sample_rate or src_rate
+            if chunk_sr != target_sr:
+                import audioop
+                pcm, resample_state = audioop.ratecv(
+                    pcm, 2, 1, chunk_sr, target_sr, resample_state
+                )
+            yield pcm
+
+
+def _iter_genie_stream(text: str):
+    """POST to genie-server /api/chat with stream=True.
+
+    Yields each `response` string delta as it arrives. Raises on
+    network failure; caller handles.
+    """
+    payload = json.dumps({
+        "messages": [{"role": "user", "content": text}],
+        "system": VOICE_SYSTEM_PROMPT,
+        "stream": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        GENIE_URL.rstrip("/") + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        for raw in resp:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("done"):
+                break
+            delta = evt.get("response") or ""
+            if delta:
+                yield delta
+
+
+# Sentence boundary chars — anywhere one of these appears we flush the
+# accumulator to Piper. Comma/semicolon are included because Piper
+# handles clause-level chunks smoothly and it dramatically cuts the
+# perceived latency: first PCM starts flowing after ~15 chars of LLM
+# output instead of waiting for the first period.
+_SENTENCE_BREAK = set(".!?,;")
+
+
+def _voice_pipeline(wav_upload: bytes):
+    """Run STT → intent/LLM → TTS. Returns (reply_wav, transcript, response_text).
+
+    Any missing engine or model unavailability propagates as a RuntimeError
+    so the VoiceHandler can return 503.
+    """
+    stt, tts = _get_engines()
+    if not stt.available:
+        raise RuntimeError("STT engine unavailable")
+    if not tts.available:
+        raise RuntimeError("TTS engine unavailable")
+
+    transcript = stt.transcribe_wav(wav_upload).strip()
+
+    # Whisper base.en frequently hallucinates a handful of common phrases
+    # when fed silence, background hum, or too-short clips. If we take
+    # the hallucination at face value it triggers the full LLM path
+    # (Genie NPU + Piper TTS ≈ 25-30 sec) generating an unwanted menu.
+    # Treat these as silence so the fast "I didn't catch that" path fires
+    # and the ESP32 gets a response in <1 sec instead of timing out.
+    if _is_whisper_hallucination(transcript):
+        print(f"[voice] dropping likely hallucination: {transcript!r}", file=sys.stderr)
+        transcript = ""
+
+    if not transcript:
+        reply_text = "I didn't catch that."
+        sr, reply_wav = tts.render_to_wav_bytes(_strip_for_tts(reply_text))
+    else:
+        canned = _intent_lookup(transcript)
+        if canned:
+            reply_text = canned
+        else:
+            enriched = _enrich_text(transcript)
+            reply_text = _voice_llm_reply(enriched) or "Sorry, I couldn't get a reply."
+        sr, reply_wav = tts.render_to_wav_bytes(_strip_for_tts(reply_text))
+
+    if not reply_wav:
+        raise RuntimeError("empty TTS output")
+
+    # Resample WAV to target SR (16 kHz) so the ESP32 codec runs one rate.
+    pcm, wav_sr = _pcm_from_wav(reply_wav)
+    if wav_sr != VOICE_TARGET_SR:
+        pcm = _resample_pcm_s16_mono(pcm, wav_sr, VOICE_TARGET_SR)
+    reply_wav = _wav_from_pcm(pcm, VOICE_TARGET_SR)
+    return reply_wav, transcript, reply_text
+
+
+def _voice_llm_reply(text: str) -> str:
+    """Non-streaming call to genie-server, collect full response.
+
+    Uses /api/chat with a minimal single-turn message so we can reuse the
+    same system-prompt shape the streaming path uses. If the model emits a
+    device-control JSON blob, hand it to the intent RPC's /api/command
+    endpoint (same as the chat SSE path) and use the confirmation instead.
+    """
+    messages = [{"role": "user", "content": text}]
+    payload = json.dumps({
+        "messages": messages,
+        "system": VOICE_SYSTEM_PROMPT,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        GENIE_URL.rstrip("/") + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            evt = json.loads(resp.read())
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as e:
+        print(f"[voice] LLM call failed: {e}", file=sys.stderr)
+        return ""
+    reply = (evt.get("message") or {}).get("content") or evt.get("response") or ""
+    reply = reply.strip()
+    if reply.startswith("{"):
+        confirmation = _command_execute(reply)
+        return confirmation or "Sorry, I couldn't do that."
+    return reply
+
+
+class VoiceHandler(BaseHTTPRequestHandler):
+    """Bearer-token gated voice endpoint for the CrowPanel P4 terminal."""
+
+    server_version = "PeregrineVoice/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._json({"ok": True, "voice_enabled": VOICE_ENABLED})
+            return
+        self._json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        if self.path != "/api/voice":
+            self._json({"error": "not found"}, status=404)
+            return
+        if not self._auth_ok():
+            self._json({"error": "unauthorized"}, status=401)
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            self._json({"error": "missing Content-Length"}, status=411)
+            return
+        if length > VOICE_MAX_BYTES:
+            self._json({"error": "payload too large"}, status=413)
+            return
+        wav = self.rfile.read(length)
+
+        # Fast path decisions (STT + intent lookup) happen synchronously
+        # before we commit to sending headers. That way if any of them
+        # fails or short-circuits, we can still return a fixed WAV with
+        # a proper Content-Length.
+        try:
+            stt, tts = _get_engines()
+            if not stt.available or not tts.available:
+                self._json({"error": "engines unavailable"}, status=503)
+                return
+
+            # Bias Whisper toward likely words. Doesn't force these — just
+            # makes the model more likely to pick them when they sound
+            # close to what was actually said.
+            initial_prompt = (
+                "Peregrine assistant. Chicago, Illinois, Springfield, "
+                "Austin, Texas. Turn on the lights. What is the "
+                "temperature. Weather forecast. Battery level. Water "
+                "level. Cabin. Trailer."
+            )
+            transcript = stt.transcribe_wav(
+                wav, initial_prompt=initial_prompt).strip()
+            if _is_whisper_hallucination(transcript):
+                print(f"[voice] dropping likely hallucination: {transcript!r}",
+                      file=sys.stderr)
+                transcript = ""
+
+            if not transcript:
+                self._send_fixed_wav(tts, "", "I didn't catch that.")
+                return
+
+            canned = _intent_lookup(transcript)
+            if canned:
+                self._send_fixed_wav(tts, transcript, canned)
+                return
+
+            # No short-circuit — stream the LLM response
+            enriched = _enrich_text(transcript)
+            self._send_streamed_llm(tts, transcript, enriched)
+
+        except ValueError as e:
+            self._json({"error": f"bad audio: {e}"}, status=400)
+        except RuntimeError as e:
+            self._json({"error": str(e)}, status=503)
+        except Exception as e:  # noqa: BLE001
+            print(f"[voice] pipeline error: {e}", file=sys.stderr)
+            # If headers already sent, best-effort close; can't send an
+            # error body at this point.
+            try:
+                self._json({"error": "internal error"}, status=500)
+            except Exception:
+                pass
+
+    def _send_fixed_wav(self, tts, transcript: str, reply_text: str):
+        """Synth `reply_text` in full, resample, send one Content-Length'd WAV."""
+        print(f"[voice] fast: transcript={transcript!r} -> reply={reply_text!r}",
+              file=sys.stderr)
+        sr, reply_wav = tts.render_to_wav_bytes(_strip_for_tts(reply_text))
+        if not reply_wav:
+            raise RuntimeError("empty TTS output")
+        pcm, wav_sr = _pcm_from_wav(reply_wav)
+        if wav_sr != VOICE_TARGET_SR:
+            pcm = _resample_pcm_s16_mono(pcm, wav_sr, VOICE_TARGET_SR)
+        reply_wav = _wav_from_pcm(pcm, VOICE_TARGET_SR)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(reply_wav)))
+        self.send_header("X-Peregrine-Transcript",
+                         urllib.parse.quote(transcript, safe=""))
+        self.send_header("X-Peregrine-Response",
+                         urllib.parse.quote(reply_text, safe=""))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(reply_wav)
+
+    def _send_streamed_llm(self, tts, transcript: str, enriched: str):
+        """Stream Genie tokens → Piper synth → PCM to the response body.
+
+        No Content-Length header; client reads until socket close
+        (esp_http_client + curl both handle this fine). Response text
+        header is filled with a placeholder before streaming; the actual
+        text is unknown until Genie finishes.
+        """
+        print(f"[voice] stream: transcript={transcript!r}"
+              + (f" enriched={enriched!r}" if enriched != transcript else ""),
+              file=sys.stderr)
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("X-Peregrine-Transcript",
+                         urllib.parse.quote(transcript, safe=""))
+        # Placeholder — the real text isn't known until Genie finishes.
+        # UIs that want the exact text can hit a follow-up endpoint later.
+        self.send_header("X-Peregrine-Response", "streaming")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        # WAV header first — data_size 0xFFFFFFFF is a "sizeless" sentinel
+        # the ESP32 client tolerates (it only skips 44 bytes and streams
+        # the rest into I2S).
+        self.wfile.write(_wav_header_bytes(VOICE_TARGET_SR, 0xFFFFFFFF))
+        self.wfile.flush()
+
+        buf = []
+        full_response = []
+        looks_like_json = None   # None until first non-ws char seen
+        bytes_streamed = 0
+
+        try:
+            for delta in _iter_genie_stream(enriched):
+                full_response.append(delta)
+
+                # JSON detection — if the model emits {"action":"..."}
+                # we can't feed it to Piper. Buffer the whole thing and
+                # hand it to /api/command at the end.
+                if looks_like_json is None:
+                    stripped = "".join(full_response).lstrip()
+                    if stripped:
+                        looks_like_json = stripped.startswith("{")
+                if looks_like_json:
+                    continue   # accumulate silently, handle at end
+
+                buf.append(delta)
+                text = "".join(buf)
+                # Flush at the last sentence boundary in the buffer so we
+                # emit whole phrases (Piper handles clause-level chunks
+                # cleanly; sub-word chunks sound choppy).
+                last = -1
+                for i, c in enumerate(text):
+                    if c in _SENTENCE_BREAK:
+                        last = i
+                if last >= 0:
+                    to_synth = text[:last + 1]
+                    buf = [text[last + 1:]] if last + 1 < len(text) else []
+                    for pcm in _stream_piper_pcm(tts, to_synth, VOICE_TARGET_SR):
+                        try:
+                            self.wfile.write(pcm)
+                            bytes_streamed += len(pcm)
+                        except (BrokenPipeError, ConnectionResetError):
+                            print("[voice] client closed mid-stream", file=sys.stderr)
+                            return
+
+            # Flush remaining accumulator OR handle JSON command
+            if looks_like_json:
+                full = "".join(full_response).strip()
+                confirmation = _command_execute(full) or "Sorry, I couldn't do that."
+                for pcm in _stream_piper_pcm(tts, confirmation, VOICE_TARGET_SR):
+                    try:
+                        self.wfile.write(pcm)
+                        bytes_streamed += len(pcm)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+            elif buf:
+                tail = "".join(buf).strip()
+                if tail:
+                    for pcm in _stream_piper_pcm(tts, tail, VOICE_TARGET_SR):
+                        try:
+                            self.wfile.write(pcm)
+                            bytes_streamed += len(pcm)
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+        except urllib.error.URLError as e:
+            print(f"[voice] Genie stream failed mid-response: {e}", file=sys.stderr)
+        finally:
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            print(f"[voice] streamed {bytes_streamed} bytes of PCM "
+                  f"({bytes_streamed/(VOICE_TARGET_SR*2):.1f}s of audio)",
+                  file=sys.stderr)
+
+    def _auth_ok(self) -> bool:
+        if not VOICE_TOKEN:
+            return False
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix):], VOICE_TOKEN)
+
+    def _json(self, obj, status=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        sys.stdout.write(
+            "[voice] %s - %s\n" % (self.address_string(), format % args)
+        )
+        sys.stdout.flush()
+
+
 class HttpsRedirectHandler(BaseHTTPRequestHandler):
     """Tiny HTTP listener that 301-redirects everything to HTTPS.
 
@@ -963,7 +1544,31 @@ def _serve_forever_with_tls(server, ctx):
     server.serve_forever()
 
 
+def _start_voice_listener():
+    """Bind the CrowPanel P4 voice endpoint on its own thread.
+
+    Only runs when PEREGRINE_VOICE_TOKEN is set — silence-by-default so the
+    endpoint isn't reachable on boxes that haven't provisioned a token yet.
+    """
+    if not VOICE_ENABLED:
+        print("[voice] endpoint disabled (PEREGRINE_VOICE_TOKEN unset)")
+        return None
+    try:
+        server = ThreadingHTTPServer((HOST, VOICE_PORT), VoiceHandler)
+    except OSError as e:
+        print(f"[voice] cannot bind {HOST}:{VOICE_PORT}: {e}", file=sys.stderr)
+        return None
+    print(f"[voice] listening on http://{HOST}:{VOICE_PORT} "
+          f"(target_sr={VOICE_TARGET_SR}, max_bytes={VOICE_MAX_BYTES})")
+    thread = threading.Thread(
+        target=server.serve_forever, daemon=True, name="voice-listener",
+    )
+    thread.start()
+    return server
+
+
 def main():
+    voice_server = _start_voice_listener()
     if TLS_ENABLED:
         ctx = _build_tls_context()
         https_server = ThreadingHTTPServer((HOST, HTTPS_PORT), ChatHandler)
@@ -999,6 +1604,9 @@ def main():
         except KeyboardInterrupt:
             pass
         server.server_close()
+    if voice_server is not None:
+        voice_server.shutdown()
+        voice_server.server_close()
     print("[web-chat] stopped.")
 
 
