@@ -755,6 +755,20 @@ def _degrees_to_cardinal(deg):
     return directions[idx]
 
 
+# `local/gps/details` carries the raw CAN 0x07 payload, not native units.
+# Bearing encodes speed as knots x 100 and course as degrees x 10
+# (Bearing main/main.c, CAN_ID_SAT_SPEED); Headwaters' can-bridge forwards
+# those scaled integers verbatim. Decode here, never at the call site.
+def _sog_to_knots(raw):
+    """Decode a raw speedOverGround field (100ths of a knot) to knots."""
+    return raw / 100.0
+
+
+def _cog_to_degrees(raw):
+    """Decode a raw courseOverGround field (10ths of a degree) to degrees."""
+    return (raw / 10.0) % 360
+
+
 def get_sensor_summary():
     """Build a human-readable summary of current sensor data for the LLM."""
     lines = []
@@ -808,10 +822,11 @@ def get_sensor_summary():
             lines.append(f"GPS satellites in use: {num_sats}")
         speed = gps_details.get("speedOverGround")
         if speed is not None:
-            lines.append(f"Speed: {speed} knots")
+            knots = _sog_to_knots(speed)
+            lines.append(f"Speed: {knots:.1f} knots ({knots * 1.15078:.1f} mph)")
         course = gps_details.get("courseOverGround")
         if course is not None:
-            lines.append(f"Course over ground: {course}°")
+            lines.append(f"Course over ground: {_cog_to_degrees(course):.0f}°")
         gnss_mode = gps_details.get("gnssMode")
         if gnss_mode is not None:
             lines.append(f"GNSS mode: {gnss_mode}")
@@ -2516,6 +2531,28 @@ _LEVEL_PATTERNS = [
 ]
 
 
+# Headwaters types the two device sources differently by default: Torrent
+# (PDM) channels default to "light" (pdm-channel-sync.js), while Switchback
+# relay channels default to "other" (switchback-channel-sync.js
+# getDefaultChannels) and there is no UI to change it. So a relay actually
+# driving a light is usually still typed "other" and would be dropped from
+# "which lights are on" if we trusted the type alone. Fall back to the
+# channel name for anything not explicitly typed — "Main Lights" counts,
+# "Water Pump" does not.
+_LIGHT_NAME_RE = re.compile(
+    r"\b(?:light|lights|lighting|lamp|lamps|sconce|sconces|dimmer|dimmers)\b", re.I)
+
+
+def _is_light_device(dev_id):
+    """True if a registry device should be reported as a light."""
+    dtype = _device_types_by_id.get(dev_id)
+    if dtype == "light":
+        return True
+    if dtype not in (None, "", "other", "unknown"):
+        return False  # explicitly some other kind of device — trust it
+    return bool(_LIGHT_NAME_RE.search(_device_names_by_id.get(dev_id, "")))
+
+
 def _get_light_status_response(light_id=None):
     """Build a spoken summary of light states from cached MQTT data.
 
@@ -2547,8 +2584,9 @@ def _get_light_status_response(light_id=None):
                     lid_int = int(lid)
                 except (ValueError, TypeError):
                     continue
-                # Only report devices of type "light"
-                if _device_types_by_id.get(lid_int) not in (None, "light"):
+                # Only report devices that look like lights. Unknown IDs (no
+                # registry entry at all) are still reported as "light <n>".
+                if lid_int in _device_types_by_id and not _is_light_device(lid_int):
                     continue
                 seen_device_ids.add(lid_int)
                 name = _device_names_by_id.get(lid_int, f"light {lid}")
@@ -2559,11 +2597,11 @@ def _get_light_status_response(light_id=None):
 
     # 2) Switchback relay-backed lights — the trailer may drive its lights
     # through Switchback rather than Torrent. Any device in the relay
-    # registry whose type is "light" gets folded in here so "what lights
+    # registry that looks like a light gets folded in here so "what lights
     # are on" reflects the actual lights the user cares about, not just
     # the Torrent subset.
     for dev_id, relay_ch in _relay_channel_by_id.items():
-        if _device_types_by_id.get(dev_id) != "light":
+        if not _is_light_device(dev_id):
             continue
         if dev_id in seen_device_ids:
             continue  # avoid double-counting if both topics somehow existed
@@ -3282,15 +3320,7 @@ def match_intent(text):
             print("  Intent: heading query")
             details = sensor_data.get("local/gps/details")
             if details and details.get("courseOverGround") is not None:
-                raw = details["courseOverGround"]
-                # GPS course over ground is 0–360°. Some publishers emit the
-                # raw NMEA field × 10 (e.g. 230.2° becomes 2302). Defensively
-                # rescale anything well outside the expected range so we never
-                # say "heading southeast at 2302 degrees."
-                deg = raw / 10.0 if abs(raw) > 360 else raw
-                deg = deg % 360
-                if abs(raw) > 360:
-                    print(f"  Heading: rescaled raw={raw} -> {deg:.1f}°")
+                deg = _cog_to_degrees(details["courseOverGround"])
                 cardinal = _degrees_to_cardinal(deg)
                 return f"We're heading {cardinal} at {deg:.0f} degrees."
             return "I don't have heading data right now."
@@ -3300,8 +3330,7 @@ def match_intent(text):
             print("  Intent: speed query")
             details = sensor_data.get("local/gps/details")
             if details and details.get("speedOverGround") is not None:
-                knots = details["speedOverGround"]
-                mph = knots * 1.15078
+                mph = _sog_to_knots(details["speedOverGround"]) * 1.15078
                 return f"We're moving at {mph:.1f} miles per hour."
             return "I don't have speed data right now."
 
