@@ -1293,8 +1293,8 @@ class VoiceHandler(BaseHTTPRequestHandler):
             # makes the model more likely to pick them when they sound
             # close to what was actually said.
             initial_prompt = (
-                "Peregrine assistant. Chicago, Illinois, Springfield, "
-                "Austin, Texas. Turn on the lights. What is the "
+                "Peregrine assistant. "
+                "Turn on the lights. What is the "
                 "temperature. Weather forecast. Battery level. Water "
                 "level. Cabin. Trailer."
             )
