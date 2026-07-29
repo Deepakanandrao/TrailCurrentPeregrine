@@ -74,7 +74,7 @@ PUBLIC_HOSTNAME = os.getenv("WEB_CHAT_PUBLIC_HOSTNAME", "")
 # Legacy/override single port — only honored when TLS is OFF.
 PORT = int(os.getenv("WEB_CHAT_PORT", "80"))
 
-# --- Voice-terminal endpoint (CrowPanel P4 push-to-talk) ---
+# --- Voice-terminal endpoint (ESP32 P4 push-to-talk) ---
 # When PEREGRINE_VOICE_TOKEN is set, we open an additional plain-HTTP
 # listener on PEREGRINE_VOICE_PORT (default 8081) that accepts a WAV upload,
 # transcribes it, runs the same intent-then-LLM path the chat UI uses, and
@@ -1252,7 +1252,7 @@ def _voice_llm_reply(text: str) -> str:
 
 
 class VoiceHandler(BaseHTTPRequestHandler):
-    """Bearer-token gated voice endpoint for the CrowPanel P4 terminal."""
+    """Bearer-token gated voice endpoint for the ESP32 P4 terminal."""
 
     server_version = "PeregrineVoice/1.0"
     protocol_version = "HTTP/1.1"
@@ -1545,7 +1545,7 @@ def _serve_forever_with_tls(server, ctx):
 
 
 def _start_voice_listener():
-    """Bind the CrowPanel P4 voice endpoint on its own thread.
+    """Bind the ESP32 P4 voice endpoint on its own thread.
 
     Only runs when PEREGRINE_VOICE_TOKEN is set — silence-by-default so the
     endpoint isn't reachable on boxes that haven't provisioned a token yet.

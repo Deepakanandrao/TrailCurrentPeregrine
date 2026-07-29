@@ -137,7 +137,7 @@ class TTSEngine:
     def render_to_wav_bytes(self, text: str) -> Tuple[int, bytes]:
         """Synthesize `text` and return `(sample_rate, wav_bytes)` in-memory.
 
-        Used by the /api/voice HTTP endpoint — the CrowPanel P4 wants the
+        Used by the /api/voice HTTP endpoint — the ESP32 P4 wants the
         response as a WAV body it can decode and hand to its I2S DAC, not
         aplay'd locally. No cache is consulted or updated (LLM replies are
         unique per turn; caching would just fill the disk).

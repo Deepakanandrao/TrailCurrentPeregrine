@@ -6,8 +6,7 @@ bridge — anything that can POST a WAV) act as a push-to-talk terminal for
 the Peregrine LLM. No wake word required — the client decides when to
 capture and when to send.
 
-The first consumer is the CrowPanel Advance ESP32-P4 10.1" HMI (see
-`YouTubeCodeSamples/elecrow-esp32-p4-10-in/` in the sibling repo).
+The first consumer is the ESP32-P4 HMI
 
 ## What the endpoint does
 
@@ -205,7 +204,7 @@ python3 -c "import urllib.parse; print(urllib.parse.unquote('$(grep -i X-Peregri
 
 - **Streaming response**: today the endpoint is unary (full WAV back in one
   response). Chunked `Transfer-Encoding` + on-the-fly Piper output could cut
-  first-audio latency in half. Not needed for the CrowPanel MVP.
+  first-audio latency in half. Not needed for the MVP.
 - **Multi-turn context**: the endpoint treats each request as a fresh
   single-turn message. If you want conversation memory the client can
   maintain a history and POST a JSON envelope wrapping the WAV (or a

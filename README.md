@@ -26,7 +26,7 @@ Entirely offline voice pipeline:
 7. **Voice terminal endpoint** — `POST http://peregrine.local:8081/api/voice`
    accepts a WAV upload, runs STT → intent-or-LLM → TTS on-board, and returns
    a WAV of the spoken reply. Lets a dumb remote push-to-talk device (e.g.
-   the CrowPanel Advance ESP32-P4) act as a mic/speaker for Peregrine
+   the ESP32-P4) act as a mic/speaker for Peregrine
    without needing a wake word or a separate ML pipeline. Bearer-token
    gated, LAN-only, disabled by default — see
    [docs/voice-terminal.md](docs/voice-terminal.md) for setup.
@@ -188,7 +188,7 @@ With MQTT connected, the assistant responds to:
 
 Device commands and sensor queries use fast regex-based intent matching (no LLM round-trip). Unrecognized requests fall through to the LLM.
 
-The same intent + LLM path is exposed over HTTP at `POST /api/voice` on port 8081, letting a push-to-talk remote (e.g. the CrowPanel Advance ESP32-P4) act as a mic/speaker for Peregrine without shipping any ML on the client side. See [docs/voice-terminal.md](docs/voice-terminal.md) to enable and test.
+The same intent + LLM path is exposed over HTTP at `POST /api/voice` on port 8081, letting a push-to-talk remote (e.g. the ESP32-P4) act as a mic/speaker for Peregrine without shipping any ML on the client side. See [docs/voice-terminal.md](docs/voice-terminal.md) to enable and test.
 
 Device names are configured in the TrailCurrent web UI and synced via MQTT. Both Torrent (PWM lights) and Switchback (relays) devices are supported. Only Torrent lights support brightness — Switchback relays are on/off only. When you say "turn off all the lights", both Torrent lights and any Switchback relays configured as type "light" are turned off.
 

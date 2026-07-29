@@ -25,7 +25,7 @@ Environment=WEB_CHAT_TLS_KEY=/home/trailcurrent/certs/server.key
 Environment=WEB_CHAT_CA_PATH=/home/trailcurrent/certs/ca.pem
 Environment=GENIE_URL=http://127.0.0.1:11434
 
-# --- CrowPanel P4 push-to-talk terminal (POST /api/voice on VOICE_PORT) ---
+# --- ESP32 P4 push-to-talk terminal (POST /api/voice on VOICE_PORT) ---
 # Bearer token is required; when unset the endpoint stays closed. Generate
 # with: openssl rand -hex 32   (then bake into the ESP32 NVS on setup).
 Environment=PEREGRINE_VOICE_PORT=8081
